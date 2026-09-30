@@ -74,10 +74,7 @@ searches the nonce.
        towerminer --rpc http://127.0.0.1:9701
 
 The node proves every block before it hands out work, and that proof runs on
-the same CPUs. Leave it one or two logical CPUs, for example on a 16-thread
-machine:
-
-    towerminer --rpc http://127.0.0.1:9701 --threads 14
+the same CPUs: see [Leave your node room](#leave-your-node-room-the-logbook-proof).
 
 To mine from another machine on your network, start the node with
 `--rpc-listen <lan-address>:9701` and point `--rpc` at it. The Bearer token
@@ -86,6 +83,33 @@ a private network or behind a firewall, never open on the Internet.
 
 Blocks found are logged (`SOLVED h=... hash=...`) and the node reports them
 with `jetsam-cli mining` / `jetsam-cli balance`.
+
+## Leave your node room: the logbook proof
+
+A Jetsam node that builds a block proves the whole history of the chain in
+it. This work, the logbook prover, runs on the CPU, and a miner on the same
+cores slows it down. Measured, the node's preparation of a block took 31 s
+with the node alone, 83 to 149 s next to a miner at normal priority on every
+core, and 35 to 38 s next to a miner at low priority, with no measurable loss
+of hash rate.
+
+towerminer therefore runs at low priority by default: nice 19 on Linux, the
+below-normal priority class on Windows. The node gets the CPU first whenever
+it needs it. The start-up log shows `priority: low (nice 19)`,
+`priority: below normal` or `priority: normal`.
+
+When the other cores of the machine mine at normal priority, reserve cores for
+the node. Measured on an AMD EPYC 7742 (Zen 2), the preparation stayed
+within its budget with 8 cores (16 threads) kept free for small blocks and
+16 cores (32 threads) for large ones. On a 64-core, 128-thread CPU:
+
+    towerminer --threads 96                  # 32 threads (16 cores) left to the node
+    towerminer --exclude-cpus 0-15,64-79     # the same, as a list, when CPU n and n+64 share a core
+
+Check which logical CPUs share a core with `lscpu -e` before writing a list.
+
+On a machine that only mines, with no node on it, `--priority normal` leaves
+the priority unchanged.
 
 ## Mining with a pool
 
@@ -127,6 +151,8 @@ at most; other characters are dropped). Without it there is no
 - `--cpus 0-7,16-23` / `--exclude-cpus 0,1` — an explicit CPU list.
 - `--threads-per-core 1|2`, `--pads 1..4`, `--prefetch 0|1` — override the
   profile.
+- `--priority low|normal` — low (default) lets a node on the same machine
+  prove its blocks first; see [Leave your node room](#leave-your-node-room-the-logbook-proof).
 - A CPU quota (Linux cgroups: containers, systemd `CPUQuota=`, rented
   machines) is detected: the miner never runs more worker threads than
   `ceil(quota / period)` and says so at start-up.

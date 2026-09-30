@@ -37,8 +37,18 @@
   `X-Jetsam-Host` header. `X-Jetsam-CPU` (CPU model, worker threads and
   profile) is still sent: pools show it per worker and use it to spot a slow
   setup. The thermal-guard build (`--features fleet`) still sends the host
-  name when no `--worker-name` is given. The Windows GUI has an optional
-  "Worker name" field.
+  name when no `--worker-name` is given.
+- **Low priority by default, `--priority low|normal`**: nice 19 on Linux
+  (set before any thread starts; a refusal is not fatal, a lower priority is
+  never raised), below-normal priority class on Windows. A Jetsam node on the
+  same machine prepares every block's logbook proof on the CPU: measured
+  31 s alone, 83-149 s next to a miner at normal priority on every core,
+  35-38 s next to a miner at low priority, with no measurable loss of hash
+  rate. `--priority normal` leaves the priority unchanged (a machine that
+  only mines). The start-up log shows the priority; the thermal-guard build
+  behaves the same.
+- **Graphical interface**: Jetsam Desktop, which embeds towerminer. The
+  former `gui/` Windows window is no longer shipped.
 - **`--status-json`**: one JSON event per line on stdout (`profile`,
   `status` every 5 s, `block`, `error`), for front ends.
 - **Clean stop** on Ctrl-C / SIGTERM / console close: exit 0 with totals.
