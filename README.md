@@ -105,9 +105,10 @@ request it adds these HTTP headers:
   node or pool knows which work this miner can compute.
 - `X-Jetsam-Hashrate`: the measured hash rate, once known.
 - `X-Jetsam-CPU`: the CPU model, the number of worker threads and the
-  profile, for example `Ryzen 9 5950X - 32t (2/core, 1 pads)`, with ` 4K!` when huge pages are missing and ` eff` under
-  `--policy efficiency`. A pool uses it to show each worker's hardware and
-  to spot a slow setup (4 KiB pages).
+  profile, for example `Ryzen 9 5950X - 32t (2/core, 1 pads)`, with ` 4K!`
+  when huge pages are missing and ` eff` under `--policy efficiency`. A pool
+  uses it to show each worker's hardware and to spot a slow setup (4 KiB
+  pages).
 
 The machine's host name is never sent. To have a pool list your machines
 separately, name each one:
