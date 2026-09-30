@@ -205,24 +205,13 @@ impl App {
                 return;
             }
         };
-        self.cfg.rpc = rpc.clone();
+        self.cfg.rpc = rpc;
         self.cfg.coinbase = self.cfg.coinbase.trim().to_string();
+        self.cfg.worker_name = self.cfg.worker_name.trim().to_string();
         self.cfg.key = self.cfg.key.trim().to_string();
         self.save_cfg();
 
-        let threads = self.threads();
-        let mut args = vec!["--rpc".to_string(), rpc];
-        if !self.cfg.coinbase.is_empty() {
-            args.push("--coinbase".into());
-            args.push(self.cfg.coinbase.clone());
-        }
-        args.extend([
-            "--threads".to_string(),
-            threads.to_string(),
-            "--policy".to_string(),
-            self.cfg.policy.arg().to_string(),
-            "--status-json".to_string(),
-        ]);
+        let args = self.cfg.miner_args(self.threads());
         let key_note = if self.cfg.key.is_empty() { "no key" } else { "key set (TOWERMINER_KEY)" };
         let wake_ctx = ctx.clone();
         match Miner::start(&exe, &args, &self.cfg.key, move || wake_ctx.request_repaint()) {
@@ -361,6 +350,15 @@ impl App {
                     .hint_text("optional")
                     .desired_width(f32::INFINITY),
             );
+            ui.add_space(6.0);
+            ui.label("Worker name");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.cfg.worker_name)
+                    .hint_text("optional")
+                    .char_limit(32)
+                    .desired_width(f32::INFINITY),
+            )
+            .on_hover_text("Shown by your pool for this PC. Empty: no name is sent.");
             ui.add_space(6.0);
             ui.label(format!("Threads (this PC has {} logical CPUs)", self.max_threads));
             let mut t = self.threads();

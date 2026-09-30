@@ -30,6 +30,15 @@
   measurements are documented next to the table in `src/main.rs`.
 - **`--threads N`** now means N logical CPUs, whole cores first; the profile
   applies inside them (it used to cap the worker count).
+- **No machine name sent by default**: the machine's host name is no longer
+  sent to the node or pool. **`--worker-name <NAME>`** sends a name of
+  your choice in `X-Jetsam-Host` (printable ASCII, 32 characters at most),
+  for per-machine statistics on a pool; without it there is no
+  `X-Jetsam-Host` header. `X-Jetsam-CPU` (CPU model, worker threads and
+  profile) is still sent: pools show it per worker and use it to spot a slow
+  setup. The thermal-guard build (`--features fleet`) still sends the host
+  name when no `--worker-name` is given. The Windows GUI has an optional
+  "Worker name" field.
 - **`--status-json`**: one JSON event per line on stdout (`profile`,
   `status` every 5 s, `block`, `error`), for front ends.
 - **Clean stop** on Ctrl-C / SIGTERM / console close: exit 0 with totals.

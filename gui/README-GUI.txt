@@ -24,7 +24,10 @@ Quick start
                      "Remember key".
    Coinbase address  Optional. Only for your own node started with
                      --allow-custom-coinbase. Leave it empty for a pool.
-   Threads           How many CPU threads to use. Fewer threads keep the PC
+   Worker name       Optional. A name for this PC that your pool can show
+                     in its statistics. Empty: no name is sent (the PC's
+                     own name is never sent).
+   Threads          How many CPU threads to use. Fewer threads keep the PC
                      more responsive.
    Policy            Hashrate: the fastest profile.
                      Efficiency: the most hashes per watt (cooler, quieter).
