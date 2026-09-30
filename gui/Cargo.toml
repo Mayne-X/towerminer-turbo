@@ -1,0 +1,30 @@
+[package]
+name = "towerminer-gui"
+version = "0.3.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Windows GUI for towerminer, the Jetsam CPU miner"
+publish = false
+
+# Standalone project: not a member of the miner workspace at the repository root.
+[workspace]
+
+[dependencies]
+# glow (OpenGL) backend only: runs on any Windows GPU driver and under Wine + Mesa.
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
