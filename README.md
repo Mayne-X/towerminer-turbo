@@ -133,7 +133,7 @@ at most; other characters are dropped). Without it there is no
 ## Tuning
 
 The built-in table covers AMD Zen 2 to Zen 5 and Intel family 6 (Sandy Bridge
-to Arrow Lake), from measurements. Your machine can do better: measure it
+to Arrow Lake), from measurements (see [BENCHMARKS.md](BENCHMARKS.md)). Your machine can do better: measure it
 once, on an otherwise idle machine:
 
     towerminer --tune 10
