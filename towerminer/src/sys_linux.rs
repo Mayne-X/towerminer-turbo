@@ -295,11 +295,33 @@ pub fn hostname() -> String {
     fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default().trim().to_string()
 }
 
-/// Lower this thread's priority (nice +10); needs no privilege.
+/// Lower this thread's priority to nice +10 (needs no privilege); a thread
+/// already at +10 or lower (--priority low: nice 19) is left alone, never
+/// raised.
 pub fn lower_thread_priority() {
     unsafe {
         let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
-        libc::setpriority(libc::PRIO_PROCESS, tid, 10);
+        if libc::getpriority(libc::PRIO_PROCESS, tid) < 10 {
+            libc::setpriority(libc::PRIO_PROCESS, tid, 10);
+        }
+    }
+}
+
+/// --priority low, as the start-up log shows it.
+pub const LOW_PRIORITY_LABEL: &str = "low (nice 19)";
+
+/// The calling thread already runs at nice 19 (the lowest).
+pub fn priority_at_or_below_low() -> bool {
+    unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) >= 19 }
+}
+
+/// Nice 19, an absolute value, for the calling thread; threads created after
+/// it inherit it (on Linux the nice value is per thread).
+pub fn set_low_priority() -> Result<(), String> {
+    if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 19) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
     }
 }
 

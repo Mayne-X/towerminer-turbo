@@ -32,8 +32,9 @@ use windows_sys::Win32::System::SystemInformation::{
     SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThread, GetProcessAffinityMask, GetProcessGroupAffinity, GetProcessTimes,
-    GetSystemTimes, OpenProcessToken, SetThreadGroupAffinity, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+    GetCurrentProcess, GetCurrentThread, GetPriorityClass, GetProcessAffinityMask, GetProcessGroupAffinity,
+    GetProcessTimes, GetSystemTimes, OpenProcessToken, SetPriorityClass, SetThreadGroupAffinity, SetThreadPriority,
+    BELOW_NORMAL_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, THREAD_PRIORITY_BELOW_NORMAL,
 };
 
 use super::{Quota, STOP};
@@ -422,6 +423,24 @@ pub fn hostname() -> String {
 pub fn lower_thread_priority() {
     unsafe {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+/// --priority low, as the start-up log shows it.
+pub const LOW_PRIORITY_LABEL: &str = "below normal";
+
+/// The process already runs in the below-normal or idle priority class.
+pub fn priority_at_or_below_low() -> bool {
+    let c = unsafe { GetPriorityClass(GetCurrentProcess()) };
+    c == BELOW_NORMAL_PRIORITY_CLASS || c == IDLE_PRIORITY_CLASS
+}
+
+/// Below-normal priority class for the whole process (every thread).
+pub fn set_low_priority() -> Result<(), String> {
+    if unsafe { SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS) } != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
     }
 }
 

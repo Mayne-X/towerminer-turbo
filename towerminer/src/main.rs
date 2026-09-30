@@ -214,6 +214,12 @@ struct Cli {
     /// before a fatal exit. The human log stays on stderr.
     #[arg(long)]
     status_json: bool,
+    /// Process priority. low (default): nice 19 on Linux, below normal on
+    /// Windows, so a Jetsam node on the same machine gets the CPU first for
+    /// its logbook proof; hashing loses nothing measurable. normal: leave the
+    /// priority as it is (a machine that only mines).
+    #[arg(long, value_enum, default_value_t = Priority::Low)]
+    priority: Priority,
 }
 
 /// Thermal-guard options (thermal-guard build only).
@@ -478,6 +484,42 @@ fn table(intel: bool, family: u32, l2_kib: usize, solo: bool, policy: Policy) ->
         (25, Policy::Efficiency) if l2_kib < 1024 => (Shape::new(2, 2, true, F), "table: Zen 3, efficiency"),
         (25 | 26, _) if l2_kib >= 1024 => (Shape::new(2, 1, false, F), "table: Zen 4/5"),
         _ => (Shape::new(2, 1, false, F), "table: unknown CPU, node shape + huge pages"),
+    }
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Priority {
+    Low,
+    Normal,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PriorityAction {
+    Keep,
+    Lower,
+}
+
+/// What --priority does, given whether the process already runs at or below
+/// the low level. Never raises a priority: `low` only lowers, `normal` never
+/// touches it.
+fn priority_action(want: Priority, at_or_below_low: bool) -> PriorityAction {
+    match want {
+        Priority::Low if !at_or_below_low => PriorityAction::Lower,
+        _ => PriorityAction::Keep,
+    }
+}
+
+/// Apply --priority to the whole process. Called first thing in `main`,
+/// before any thread exists: on Linux the nice value is per thread and a new
+/// thread inherits its creator's. A refusal is not fatal.
+fn apply_priority(want: Priority) {
+    match (want, priority_action(want, sys::priority_at_or_below_low())) {
+        (Priority::Normal, _) => eprintln!("priority: normal"),
+        (_, PriorityAction::Keep) => eprintln!("priority: {} (already)", sys::LOW_PRIORITY_LABEL),
+        (_, PriorityAction::Lower) => match sys::set_low_priority() {
+            Ok(()) => eprintln!("priority: {}", sys::LOW_PRIORITY_LABEL),
+            Err(e) => eprintln!("priority: unchanged (lowering refused: {e})"),
+        },
     }
 }
 
@@ -2385,6 +2427,7 @@ fn check_hardware(cli: &Cli) -> bool {
 
 fn main() {
     let cli = Cli::parse();
+    apply_priority(cli.priority);
     if cli.status_json {
         status::enable_json();
     }
@@ -2497,6 +2540,27 @@ mod tests {
         let c = cli(&[]).unwrap();
         assert_eq!(reg_target(&c), None);
         assert!(!start_thermal(&c).guarded);
+    }
+
+    #[test]
+    fn priority_defaults_to_low() {
+        assert_eq!(cli(&[]).unwrap().priority, Priority::Low);
+        assert_eq!(cli(&["--priority", "low"]).unwrap().priority, Priority::Low);
+        assert_eq!(cli(&["--priority", "normal"]).unwrap().priority, Priority::Normal);
+        assert!(cli(&["--priority", "high"]).is_err());
+        assert!(cli(&["--priority", "idle"]).is_err());
+        assert!(cli(&["--priority"]).is_err());
+    }
+
+    #[test]
+    fn priority_action_only_ever_lowers() {
+        // low: lower a process above the low level, leave one already at or
+        // below it alone (never raise it back).
+        assert_eq!(priority_action(Priority::Low, false), PriorityAction::Lower);
+        assert_eq!(priority_action(Priority::Low, true), PriorityAction::Keep);
+        // normal: the priority is left as it is, whatever it is.
+        assert_eq!(priority_action(Priority::Normal, false), PriorityAction::Keep);
+        assert_eq!(priority_action(Priority::Normal, true), PriorityAction::Keep);
     }
 
     // ---------------------------------------------------------------------
