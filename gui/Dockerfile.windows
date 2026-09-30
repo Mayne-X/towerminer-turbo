@@ -1,6 +1,0 @@
-# MinGW-w64 cross-linker for x86_64-pc-windows-gnu. The Rust toolchain is not
-# in the image: build-windows.sh mounts the host's rustup (saves ~1 GB of disk).
-# Same instructions as the miner's build image, so Docker reuses its layers.
-FROM ubuntu:22.04
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 zip file ca-certificates && rm -rf /var/lib/apt/lists/*
