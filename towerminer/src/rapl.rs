@@ -140,7 +140,7 @@ extern "C" {
 ///
 /// posix_spawnp directly, not std::process::Command: Command links glibc's
 /// pidfd_spawnp/pidfd_getpid, which made the binary require GLIBC_2.39
-/// (v0.1 needed 2.34) — a miner that no longer starts on half the fleet.
+/// (v0.1 needed 2.34) — a miner that no longer starts on older distributions.
 fn spawn_capture(argv: &[String]) -> Option<String> {
     let cargs: Vec<CString> = argv.iter().map(|a| CString::new(a.as_str()).ok()).collect::<Option<_>>()?;
     let mut ptrs: Vec<*mut libc::c_char> = cargs.iter().map(|c| c.as_ptr() as *mut libc::c_char).collect();

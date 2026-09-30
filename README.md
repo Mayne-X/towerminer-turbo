@@ -1,104 +1,231 @@
-# towerminer — TowerWalk CPU miner for Jetsam (v1.4)
+# towerminer
 
-Private. Fork of `jetsam-extminer`: same wire protocol (getBlockTemplate /
-submitBlock, Bearer key, pool `nonce_prefix` in bits 96..128, per-process
-offset in bits 64..96), new engine for the cache-resident walk.
+A free, open-source CPU miner for **Jetsam (JTM)**, for the TowerWalk proof of
+work (Jetsam v1.4 and later). It speaks the same protocol as `jetsam-miner`
+(`jetsam_getBlockTemplate` / `jetsam_submitBlock` over JSON-RPC, Bearer key),
+so it mines against **your own Jetsam node** or against a **compatible pool**.
 
-## v0.2.2 (2026-09-30)
+What it does differently from the miner built into the node:
 
-- **Submission**: every solution on its own thread (at most 4 in flight),
-  45 s timeout (the node may hold a submit ~30 s while it finishes its proof),
-  one attempt only; no answer = `unknown` (neither accepted nor refused).
-  Report line: `found / accepted / refused / unknown`.
-- **Template poll**: 30 s timeout; exponential backoff only when the pool
-  does not answer; an answered error retries after `--poll-ms`.
-- **Table**: Zen 4/5 (L2 >= 1 MiB) 2 threads/core x 1 pad (+10 % on a
-  7950X3D); Zen 2 2 x 1 x prefetch (+7 % on 2x EPYC 7742) [MEASURED
-  2026-09-30]. Zen 3 unchanged.
-- **Pipe + prefetch**: the pipelined walk now has a prefetch variant, so
-  `--pads 1 --prefetch 1` keeps the pipe (gated: both variants, 2M and 4K).
-- **--tune**: foreign CPU load measured before and during each candidate;
-  above 5 % the candidate is `noisy` and nothing is stored without
-  `--tune-force` (`foreign_busy`, `cv`, `noisy` in tune.json v3).
-- Worker pinning failures are logged; the gate threads run at nice +10 under
-  the thermal watchdog and the gate prints the guard's longest reading gap.
+- persistent worker threads pinned to CPUs, each owning its scratchpads in
+  huge pages (2 MiB transparent huge pages on Linux, large pages on Windows);
+- several nonces walked in lockstep per thread, and a profile (threads per
+  core, pads per thread, prefetch) chosen from the CPU family, the L2 size and
+  the SMT layout — or measured on your machine with `--tune`;
+- every solution is recomputed by the reference implementation before it is
+  submitted, a sentinel hash is re-checked every 4096 hashes, and a golden
+  self-test runs at start-up. A miner that diverges from the reference stops.
 
-## v0.2 (2026-09-28)
+Version 0.3.0. License: Apache-2.0 (see `LICENSE`). The Jetsam sources it
+builds on are vendored unmodified in `vendor/` (Apache-2.0).
 
-- **Fast kernel** (`--kernel auto` = fast): at 1 pad, byte-offset addressing
-  + one-add fill + pipelined fill anchors + 8-seed sponge batch; at >= 2 pads,
-  grouped fold. Every lever gated end to end before it was timed.
-- **Two policies**: `--policy hashrate` (default) and `--policy efficiency`
-  (most hashes per joule; on Zen 3: 2 threads/core x 2 pads x prefetch).
-  `--tune N` measures both on the machine and stores them (`tune.json` v2,
-  keyed to the binary's sha256, the CPU set and the THP mode).
-- **Thermal guard on its own thread**: reads every 250 ms (50 ms while the
-  regulator runs), stops at 81 C (never above 82), predictive on a sustained
-  slope; refuses to start without a sensor (`--no-thermal-guard` to force);
-  workers stop hashing if the guard is starved.
-- **Duty-cycle regulator** instead of pause/resume: all workers hash during the
-  first `d x 1 s` of each second, `d` from a PI controller on Tctl
-  (`--temp-target`, default 74 C), start-up ramp from 0.3 (`--ramp-secs 10`).
-- **Huge pages verified per worker** (`/proc/self/smaps`), `--require-huge`.
-- **Solutions submitted at once** from a dedicated thread with its own HTTP
-  client (5 s timeouts); the template id is refreshed when the pool re-serves
-  the same content.
-- `--bench-walk` reports H/s, package W (RAPL), H/J, Tctl/Tccd, clock;
-  `--check-nonces`, `--check-hardware`, `scripts/build.sh` (release gate).
+## Requirements
 
-## Measured on the lab box (Ryzen 9 5950X, Zen 3, 16c/32t), 2026-09-28
+- An x86-64 CPU with SSE4.1 and PCLMULQDQ: practically every CPU since 2011
+  (Intel Westmere / Sandy Bridge, AMD Bulldozer and later). Wider units
+  (AVX2, VPCLMULQDQ, AVX-512) are used when present.
+- **Linux**: glibc 2.34 or newer — Ubuntu 22.04 and 24.04, Debian 12, Fedora
+  35+, and so on.
+- **Windows**: Windows 10 or 11, 64-bit.
+- A few MiB of memory per worker thread.
 
-One ABAB series, 20 s x 5, median, package power from RAPL; binary sha256
-767336f1… (the release). Raw files: `/root/towerminer-v02/raw2/e8-final.tsv`.
+Check a machine before mining:
 
-| config | H/s | W | H/J | Tctl max | vs node | vs v0.1 |
-|---|---:|---:|---:|---:|---:|---:|
-| node search path (rayon, 32 threads, 4K pages) | 12 295 | 127.6 | 96.4 | 59.6 | — | — |
-| v0.1 (1 thread/core x 1 pad) | 16 117 | 138.4 | 116.5 | 65.1 | +31.1 % | — |
-| v0.2 `--policy hashrate` (1 x 1, fast, pipe, ring 8) | 16 892 | 136.9 | 123.4 | 63.2 | +37.4 % | +4.8 % |
-| v0.2 `--policy efficiency` (2 x 2, prefetch, grouped fold) | 16 378 | 115.8 | 141.4 | 59.6 | +33.2 % | +1.6 %, H/J +21.4 % |
+    towerminer --check-hardware
 
-Same thermal budget, 180 s x 3 from < 50 C (`e8-r4.tsv`): v0.1 pause 58 /
-resume 53 C vs v0.2 regulator at 56 C.
+## Download and verify
 
-| config | H/s | W | H/J | Tctl max | Tctl mean (60-180 s) |
-|---|---:|---:|---:|---:|---:|
-| v0.1 pause/resume | 6 482 | 75.2 | 88.6 | 60.4 | 55.6 |
-| v0.2 regulator, v0.1 kernel | 7 412 (+14 %) | 86.2 | 86.0 | 63.9 | 55.3 |
-| v0.2 `--policy hashrate` | 8 649 (+33 %) | 91.5 | 94.6 | 62.8 | 56.1 |
-| v0.2 `--policy efficiency` | 16 494 (+154 %) | 116.4 | 141.7 | 56.0 | 54.9 |
+Each release ships:
 
-On a machine that runs hot, `--policy efficiency` is the first lever; the
-regulator holds the target when even that is too hot. Bench runs start at
-full duty (peaks above target at the start); mining starts with the ramp.
+- `towerminer-0.3.0-linux-x86_64.tar.gz` (binary, README, LICENSE)
+- `towerminer-0.3.0-windows-x86_64.zip` (`towerminer.exe`, README, LICENSE)
+- `SHA256SUMS`
 
-Earlier fleet numbers (v0.1, vs the node, 2026-09-26): EPYC 7742 +24 %,
-5950X +35 %, 7950X3D +42 %, 7900X +43 % per core, 9950X3D +28 % (one CCD).
-The v0.2 kernel gains are measured on Zen 3 only; on Zen 2/4/5 they are
-derived from the same mechanism — run `--tune` on the machine.
+Verify before you run:
 
-## Safety
+    sha256sum -c SHA256SUMS --ignore-missing        # Linux
+    certutil -hashfile towerminer-0.3.0-windows-x86_64.zip SHA256   # Windows
 
-- `--gate`: 256 golden vectors end to end + random seeds vs the vendored
-  reference walk, for every kernel shape (base/fast x pads 1..4 x prefetch x
-  2M/4K) and the pipelined chain. Mutant builds (`--features
-  mutant-xorshift28` / `mutant-lane-order`) must FAIL it.
-- `--check-nonces N`: every solution recomputed from its nonce (seed ring,
-  pipelined anchors), duplicates and region checked; submit latency printed.
-- Start-up self-test on the exact profile (exit 2), every solution
-  re-checked by the reference walk before submit, sentinel 1/4096 (exit 3).
-- Exit codes: 1 fatal, 2 self-test, 3 divergence, 4 huge pages required and
-  absent, 5 no temperature sensor, 82 thermal.
+## Solo mining with your own node
 
-## Usage
+This is the way to mine that keeps Jetsam decentralized: your node follows
+and validates the chain, builds and proves each block, and towerminer only
+searches the nonce.
 
-    TOWERMINER_KEY=<pool key> towerminer --rpc http://<pool>:9512 [--cpus LIST]
-    towerminer --policy efficiency ...        # coolest, most H/J
-    towerminer --temp-target 70 ...           # regulate lower
-    towerminer --tune 10                      # once per machine, quiet window
-    towerminer --bench-walk 20 [--bench-regulate]
-    towerminer --gate ; towerminer --check-nonces 5 ; towerminer --check-hardware
-    scripts/build.sh                          # release build + release gate
+1. Run a synchronized Jetsam node (v1.4 or later) in external-mining mode,
+   with a long random token of your choice:
 
-Vendored sources: `vendor/` = `git archive ea67571` of jetsam
-(`vendor/SOURCE_COMMIT`, `VENDOR.sha256`), never modified.
+       jetsam --mode extminer --mining-key '<long-random-token>'
+
+   The node's JSON-RPC listens on `127.0.0.1:9701` by default. By default the
+   node pays its own wallet's active address (or `--miner-address j1...`).
+   To let the miner choose the payout address, add `--allow-custom-coinbase`
+   on the node and `--coinbase j1...` on towerminer.
+
+2. Start towerminer next to it:
+
+       towerminer --rpc http://127.0.0.1:9701 --key '<long-random-token>'
+
+   The key can also come from the environment, which keeps it out of the
+   process list:
+
+       export TOWERMINER_KEY='<long-random-token>'      # Linux
+       set TOWERMINER_KEY=<long-random-token>           # Windows (cmd)
+       towerminer --rpc http://127.0.0.1:9701
+
+The node proves every block before it hands out work, and that proof runs on
+the same CPUs. Leave it one or two logical CPUs, for example on a 16-thread
+machine:
+
+    towerminer --rpc http://127.0.0.1:9701 --threads 14
+
+To mine from another machine on your network, start the node with
+`--rpc-listen <lan-address>:9701` and point `--rpc` at it. The Bearer token
+authenticates the miner but plain HTTP is not encrypted: keep the RPC port on
+a private network or behind a firewall, never open on the Internet.
+
+Blocks found are logged (`SOLVED h=... hash=...`) and the node reports them
+with `jetsam-cli mining` / `jetsam-cli balance`.
+
+## Mining with a pool
+
+Any pool that serves the `jetsam-miner` protocol works:
+
+    towerminer --rpc http://<pool-host>:<port> --key <your-pool-key>
+
+The pool assigns each miner its own nonce region; two towerminer processes
+behind the same key never search the same nonces.
+
+With every request the miner tells the node or pool its version, its current
+hash rate, its CPU model and profile, and the machine's host name (HTTP
+headers `X-Jetsam-*`), which pools use to label workers on their dashboards.
+
+## Choosing the CPUs
+
+- `--threads N` — use N logical CPUs, whole cores first (both SMT siblings of
+  a core, then the next core). The profile applies inside them: on a CPU whose
+  profile runs one thread per core, `--threads 8` on 4 cores runs 4 workers.
+- `--cpus 0-7,16-23` / `--exclude-cpus 0,1` — an explicit CPU list.
+- `--threads-per-core 1|2`, `--pads 1..4`, `--prefetch 0|1` — override the
+  profile.
+- A CPU quota (Linux cgroups: containers, systemd `CPUQuota=`, rented
+  machines) is detected: the miner never runs more worker threads than
+  `ceil(quota / period)` and says so at start-up.
+
+## Tuning
+
+The built-in table covers AMD Zen 2 to Zen 5 and Intel family 6 (Sandy Bridge
+to Arrow Lake), from measurements. Your machine can do better: measure it
+once, on an otherwise idle machine:
+
+    towerminer --tune 10
+
+This tries every candidate profile twice (about 5 minutes), keeps the fastest,
+and stores it (`~/.config/towerminer/tune.json` on Linux,
+`%APPDATA%\towerminer\tune.json` on Windows). Later runs load it
+automatically; `--no-tune-file` ignores it. If other programs keep the CPUs
+busy during the measurement, nothing is stored (`--tune-force` stores it
+anyway). `--policy efficiency` loads the profile with the most hashes per
+joule: from the table on AMD Zen 3, from `--tune` where power could be
+measured (Linux, RAPL readable).
+
+## Huge pages (worth about 20-25 %)
+
+**Linux** — transparent huge pages must not be disabled. Ubuntu and Debian
+default to `madvise`, which is all the miner needs:
+
+    cat /sys/kernel/mm/transparent_hugepage/enabled      # [madvise] or [always]
+    echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+
+With THP set to `never` the miner refuses to start (exit 4) unless you pass
+`--no-huge`. The start-up line `huge pages: N/N workers in 2M pages` confirms
+it works.
+
+**Windows** — large pages need the "Lock pages in memory" right:
+
+1. Run `secpol.msc` (Windows Pro / Enterprise / Education).
+2. Local Policies → User Rights Assignment → **Lock pages in memory**.
+3. Add your user account, OK.
+4. Sign out and back in (or reboot).
+
+Without it the miner runs in normal pages, about 20-25 % slower, and says so
+once at start-up. `towerminer --check-hardware` shows the `largepage` state.
+
+## Checking the miner
+
+    towerminer --check-hardware          # CPU backend, caches, huge pages, quota
+    towerminer --gate                    # bit-exact gate: 256 golden vectors + 1000 random seeds, every kernel shape
+    towerminer --check-nonces 20         # mine a dummy target 20 s; every solution recomputed from its nonce
+    towerminer --bench-walk 20           # hash rate of the chosen profile
+
+`--gate` must print `GATE PASS`, `--check-nonces` must report `bad=0 dup=0
+outside_region=0`.
+
+## Output for front ends (`--status-json`)
+
+With `--status-json`, stdout carries one JSON object per line (flushed at
+every line); the human log stays on stderr:
+
+    {"type":"profile","version":"0.3.0","backend":"avx2+vpclmul","cpu":"Ryzen 9 5950X","threads":16,"tpc":1,"pads":1,"prefetch":false,"kernel":"fast(simple+fill1,pipe)","pages":"2M"}
+    {"type":"status","ts":1790763206,"hps":16890.2,"height":25310,"found":3,"accepted":3,"refused":0,"unknown":0,"uptime_s":3605,"state":"mining","message":""}
+    {"type":"block","ts":1790763300,"height":25311,"result":"accepted","hash":"<block hash, hex>"}
+    {"type":"error","message":"..."}
+
+- `profile` once at start; `pages` is `2M`/`4K` (Linux) or `large`/`normal`
+  (Windows).
+- `status` every 5 s; `hps` over the last 10 s; `height` is null before the
+  first template; `state` is `mining`, `waiting` (no work yet, or the last
+  block was ours) or `error` (node or pool unreachable, bad key), with
+  `message` saying why.
+- `block` for every submitted solution: `accepted`, `refused` or `unknown`
+  (no answer: the block may still have been accepted); `hash` when accepted.
+- `error` before any exit with a non-zero code.
+
+Ctrl-C (or SIGTERM, or closing the console) stops the miner cleanly: the
+solutions already submitted get a few seconds for their answer, the totals
+are printed, exit code 0.
+
+## Exit codes
+
+| code | meaning |
+|---:|---|
+| 0 | clean stop |
+| 1 | fatal error (no usable CPU, memory mapping failed, malformed template, ...) |
+| 2 | start-up self-test failed, or invalid arguments |
+| 3 | the kernel diverged from the reference walk (nothing was submitted) |
+| 4 | huge pages required (`--require-huge`) and absent, or THP disabled |
+
+## Temperature
+
+This build has **no thermal guard**: it does not read any temperature sensor
+and never stops on its own because of heat. Your CPU still throttles itself
+when it runs too hot; watch your temperatures, especially on laptops and
+small cases, and use `--threads` to mine on fewer CPUs.
+
+The source also has an optional thermal-guard build (Linux only, `cargo build
+--release --features fleet`): it refuses to start without a CPU temperature
+sensor (exit 5, `--no-thermal-guard` to override), regulates the duty cycle to
+a target temperature and stops at 81 C (exit 82). See `--help` of that build.
+
+## Building from source
+
+A recent stable Rust toolchain (the release is built with Rust 1.96).
+
+Linux:
+
+    cargo build --release
+    ./target/release/towerminer --gate
+
+Windows executable, cross-compiled from Linux (MinGW-w64):
+
+    sudo apt install gcc-mingw-w64-x86-64
+    rustup target add x86_64-pc-windows-gnu
+    cargo build --release --target x86_64-pc-windows-gnu
+
+The release artifacts are built by `scripts/build.sh` (Docker, Ubuntu 22.04
+for the glibc floor), which also runs the release gate: vendored sources
+checked against `VENDOR.sha256`, unit tests, `--gate`, `--check-nonces`.
+
+The vendored Jetsam sources (`vendor/`, `git archive` of jetsam commit
+`ea67571`, see `vendor/SOURCE_COMMIT`) are never modified: `VENDOR.sha256`
+lists every file.

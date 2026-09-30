@@ -1,142 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Machine facts read from the kernel: cache sizes, SMT siblings, affinity,
-//! huge pages, temperature. Nothing here guesses from a CPU model name.
+//! Machine facts: cache sizes, SMT siblings, affinity, large pages, CPU quota,
+//! CPU identity. Nothing here guesses from a CPU model name.
+//!
+//! The operating-system side lives in `sys_linux.rs` / `sys_windows.rs`; both
+//! export the same functions, re-exported from here.
 use std::collections::BTreeSet;
-use std::fs;
 
-use crate::walk::PAD_BYTES;
+#[cfg(target_os = "linux")]
+#[path = "sys_linux.rs"]
+mod os;
+#[cfg(windows)]
+#[path = "sys_windows.rs"]
+mod os;
+#[cfg(not(any(target_os = "linux", windows)))]
+compile_error!("towerminer supports Linux and Windows on x86-64");
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!("towerminer supports x86-64 only");
 
-const HUGE: usize = 2 << 20;
-const PAGE: usize = 4096;
+pub use os::*;
 
-/// One region of `pads` contiguous 512 KiB pads, 2 MiB aligned and advised
-/// for transparent huge pages. A pad set in 4 KiB pages misses the dTLB on
-/// almost every read [MEASURED 2026-09-26: 2 pads/core, THP vs 4K = 21.5 vs
-/// 13.9 kH/s on a 7900X; +21 % single-thread on an EPYC 7742; 2026-09-28:
-/// -24 % on a 5950X thread].
-///
-/// The mapping carries one PROT_NONE page at each end, so the kernel can
-/// never merge it with a neighbour: the VMA that holds `base` in
-/// /proc/self/smaps is this region's and nobody else's (see [`Region::huge_kb`]).
-pub struct Region {
-    map: *mut u8,
-    map_len: usize,
-    base: *mut u8,
-    /// Length of the advised (huge) span starting at `base`.
-    span: usize,
-    pub pads: Vec<*mut u64>,
-}
+/// Set by Ctrl-C / SIGTERM (see `install_stop_handler`): a clean stop.
+pub static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-unsafe impl Send for Region {}
-
-impl Region {
-    /// Allocated and first-touched by the calling thread, so its pages land on
-    /// that thread's NUMA node.
-    pub fn new(pads: usize, huge: bool) -> std::io::Result<Region> {
-        unsafe {
-            let span = (pads * PAD_BYTES).div_ceil(HUGE) * HUGE;
-            // span + 2M of alignment slack, + one guard page at each end.
-            let map_len = span + HUGE + 2 * PAGE;
-            let p = libc::mmap(
-                std::ptr::null_mut(),
-                map_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            );
-            if p == libc::MAP_FAILED {
-                return Err(std::io::Error::last_os_error());
-            }
-            let map = p as *mut u8;
-            if libc::mprotect(map as *mut _, PAGE, libc::PROT_NONE) != 0
-                || libc::mprotect(map.add(map_len - PAGE) as *mut _, PAGE, libc::PROT_NONE) != 0
-            {
-                let e = std::io::Error::last_os_error();
-                libc::munmap(p, map_len);
-                return Err(e);
-            }
-            let first = map as usize + PAGE;
-            let base = ((first + HUGE - 1) & !(HUGE - 1)) as *mut u8;
-            debug_assert!(base as usize + span <= map as usize + map_len - PAGE);
-            let advice = if huge { libc::MADV_HUGEPAGE } else { libc::MADV_NOHUGEPAGE };
-            libc::madvise(base as *mut _, span, advice);
-            std::ptr::write_bytes(base, 0, pads * PAD_BYTES);
-            let v = (0..pads).map(|k| base.add(k * PAD_BYTES) as *mut u64).collect();
-            Ok(Region { map, map_len, base, span, pads: v })
-        }
-    }
-
-    /// AnonHugePages (KiB) of the VMA holding this region, read from
-    /// /proc/self/smaps. `None` if smaps cannot be read.
-    pub fn huge_kb(&self) -> Option<u64> {
-        let s = fs::read_to_string("/proc/self/smaps").ok()?;
-        smaps_anon_huge_kb(&s, self.base as usize)
-    }
-
-    /// What `huge_kb` reads when every pad sits in 2 MiB pages.
-    pub fn expected_huge_kb(&self) -> u64 {
-        (self.span / 1024) as u64
-    }
-}
-
-impl Drop for Region {
-    fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.map as *mut _, self.map_len);
-        }
-    }
-}
-
-/// `AnonHugePages` of the smaps block whose `[start, end)` contains `addr`.
-pub fn smaps_anon_huge_kb(smaps: &str, addr: usize) -> Option<u64> {
-    let mut inside = false;
-    for line in smaps.lines() {
-        let head = line.split(' ').next().unwrap_or("");
-        if let Some((a, b)) = head.split_once('-') {
-            if let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) {
-                if inside {
-                    // Next VMA without an AnonHugePages line in ours.
-                    return Some(0);
-                }
-                inside = a <= addr && addr < b;
-                continue;
-            }
-        }
-        if inside {
-            if let Some(v) = line.strip_prefix("AnonHugePages:") {
-                return v.split_whitespace().next()?.parse().ok();
-            }
-        }
-    }
-    if inside {
-        Some(0)
-    } else {
-        None
-    }
-}
-
-pub fn anon_huge_kb() -> u64 {
-    fs::read_to_string("/proc/self/smaps_rollup")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("AnonHugePages:"))
-                .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
-        })
-        .unwrap_or(0)
-}
-
-pub fn thp_mode() -> String {
-    fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
-        .map(|s| {
-            s.split_whitespace()
-                .find(|w| w.starts_with('['))
-                .unwrap_or("?")
-                .trim_matches(|c| c == '[' || c == ']')
-                .to_string()
-        })
-        .unwrap_or_else(|_| "unavailable".into())
+pub fn stop_requested() -> bool {
+    STOP.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 pub fn parse_list(s: &str) -> BTreeSet<usize> {
@@ -153,76 +40,65 @@ pub fn parse_list(s: &str) -> BTreeSet<usize> {
     out
 }
 
-pub fn allowed_cpus() -> BTreeSet<usize> {
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
-            return (0..std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)).collect();
-        }
-        (0..libc::CPU_SETSIZE as usize).filter(|&c| libc::CPU_ISSET(c, &set)).collect()
+// ---------------------------------------------------------------------------
+// CPU identity (cpuid, the same on every OS)
+// ---------------------------------------------------------------------------
+
+pub struct CpuId {
+    pub vendor: String,
+    /// Display family (base + extended), as Linux prints `cpu family`.
+    pub family: u32,
+    pub model: u32,
+    pub brand: String,
+}
+
+impl CpuId {
+    pub fn intel(&self) -> bool {
+        self.vendor == "GenuineIntel"
     }
 }
 
-pub fn pin_current(cpu: usize) -> std::io::Result<()> {
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_SET(cpu, &mut set);
-        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
+#[allow(unused_unsafe)]
+fn cpuid_leaf(leaf: u32) -> [u32; 4] {
+    // SAFETY: cpuid exists on every x86-64 CPU.
+    let r = unsafe { core::arch::x86_64::__cpuid(leaf) };
+    [r.eax, r.ebx, r.ecx, r.edx]
+}
+
+pub fn cpuid() -> &'static CpuId {
+    static ID: std::sync::OnceLock<CpuId> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let l0 = cpuid_leaf(0);
+        let mut v = Vec::with_capacity(12);
+        for r in [l0[1], l0[3], l0[2]] {
+            v.extend_from_slice(&r.to_le_bytes());
         }
-    }
-}
-
-/// Busy and total jiffies of `cpus` since boot, from /proc/stat. Busy = user
-/// + nice + system + irq + softirq + steal; total adds idle + iowait.
-pub fn cpu_ticks(cpus: &[usize]) -> Option<(u64, u64)> {
-    cpu_ticks_in(&fs::read_to_string("/proc/stat").ok()?, cpus)
-}
-
-fn cpu_ticks_in(stat: &str, cpus: &[usize]) -> Option<(u64, u64)> {
-    let (mut busy, mut total, mut seen) = (0u64, 0u64, 0usize);
-    for l in stat.lines() {
-        // "cpuN ..." only: the aggregate "cpu  ..." line is not a CPU.
-        let Some(rest) = l.strip_prefix("cpu").filter(|r| r.starts_with(|c: char| c.is_ascii_digit())) else {
-            continue;
-        };
-        let mut f = rest.split_whitespace();
-        let Some(id) = f.next().and_then(|x| x.parse::<usize>().ok()) else { continue };
-        if !cpus.contains(&id) {
-            continue;
+        let vendor = String::from_utf8_lossy(&v).trim_end_matches('\0').to_string();
+        let eax = cpuid_leaf(1)[0];
+        let base = (eax >> 8) & 0xF;
+        let family = if base == 0xF { base + ((eax >> 20) & 0xFF) } else { base };
+        let model = ((eax >> 4) & 0xF) | if base == 6 || base == 0xF { ((eax >> 16) & 0xF) << 4 } else { 0 };
+        let mut brand = String::new();
+        if cpuid_leaf(0x8000_0000)[0] >= 0x8000_0004 {
+            let mut b = Vec::with_capacity(48);
+            for leaf in 0x8000_0002..=0x8000_0004u32 {
+                for r in cpuid_leaf(leaf) {
+                    b.extend_from_slice(&r.to_le_bytes());
+                }
+            }
+            brand = String::from_utf8_lossy(&b).trim_matches(|c: char| c == '\0' || c.is_whitespace()).to_string();
+            // Some parts pad the middle of the string; the kernel prints it as is.
+            while brand.contains("  ") {
+                brand = brand.replace("  ", " ");
+            }
         }
-        let v: Vec<u64> = f.take(8).map(|x| x.parse().unwrap_or(0)).collect();
-        if v.len() < 8 {
-            continue;
-        }
-        let b = v[0] + v[1] + v[2] + v[5] + v[6] + v[7];
-        busy += b;
-        total += b + v[3] + v[4];
-        seen += 1;
-    }
-    (seen > 0).then_some((busy, total))
+        CpuId { vendor, family, model, brand }
+    })
 }
 
-/// CPU time of this process, all threads (utime + stime), jiffies.
-pub fn self_ticks() -> Option<u64> {
-    let s = fs::read_to_string("/proc/self/stat").ok()?;
-    let f: Vec<&str> = s.rsplit_once(')')?.1.split_whitespace().collect();
-    Some(f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?)
-}
-
-fn cache_kib(cpu: usize, index: usize) -> Option<usize> {
-    let s = fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/cache/index{index}/size")).ok()?;
-    let s = s.trim();
-    if let Some(k) = s.strip_suffix('K') {
-        k.parse().ok()
-    } else if let Some(m) = s.strip_suffix('M') {
-        m.parse::<usize>().ok().map(|m| m * 1024)
-    } else {
-        s.parse().ok()
-    }
-}
+// ---------------------------------------------------------------------------
+// Topology
+// ---------------------------------------------------------------------------
 
 pub struct Topology {
     /// Physical cores: sibling groups restricted to the allowed CPUs, each
@@ -240,51 +116,101 @@ impl Topology {
             if seen.contains(&c) {
                 continue;
             }
-            let sib = fs::read_to_string(format!(
-                "/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list"
-            ))
-            .map(|s| parse_list(&s))
-            .unwrap_or_else(|_| [c].into_iter().collect());
-            let g: Vec<usize> = sib.into_iter().filter(|x| allowed.contains(x)).collect();
+            let sib = os::siblings_of(c).unwrap_or_else(|| [c].into_iter().collect());
+            let mut g: Vec<usize> = sib.into_iter().filter(|x| allowed.contains(x)).collect();
+            if !g.contains(&c) {
+                g.insert(0, c);
+            }
             seen.extend(g.iter().copied());
             groups.push(g);
         }
         let first = *allowed.iter().next().unwrap_or(&0);
-        // index2 = unified L2 on every x86 part this targets; index3 = L3.
+        // Level 2 = the unified L2 on every x86 part this targets.
         Topology {
             cores: groups,
-            l2_kib: cache_kib(first, 2).unwrap_or(512),
-            l3_kib: cache_kib(first, 3).unwrap_or(0),
+            l2_kib: os::cache_kib(first, 2).unwrap_or(512),
+            l3_kib: os::cache_kib(first, 3).unwrap_or(0),
         }
+    }
+
+    /// At least one core with two CPUs in the set.
+    pub fn smt(&self) -> bool {
+        self.cores.iter().any(|g| g.len() > 1)
     }
 }
 
-/// Other miners on this machine, as `pid:exe`. Reported, never touched.
-pub fn other_miners() -> Vec<String> {
-    let mut others = Vec::new();
-    let Ok(dir) = fs::read_dir("/proc") else { return others };
-    let me = std::process::id().to_string();
-    for e in dir.flatten() {
-        let pid = e.file_name().to_string_lossy().to_string();
-        if pid == me || !pid.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        if let Ok(cmd) = fs::read(e.path().join("cmdline")) {
-            let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
-            let first = cmd.split_whitespace().next().unwrap_or("");
-            let exe = first.rsplit('/').next().unwrap_or("");
-            if ["towerminer", "jetsam-miner", "veld-worker", "xmrig", "rplant"].iter().any(|m| exe.starts_with(m))
-                || cmd.contains("--mode miner")
-            {
-                others.push(format!("{pid}:{exe}"));
+/// `n` logical CPUs of `cores`, whole cores first (both siblings of the first
+/// core, then of the second...), so the profile's per-core rule then applies
+/// inside the set.
+pub fn take_logical(cores: &[Vec<usize>], n: usize) -> BTreeSet<usize> {
+    let mut out = BTreeSet::new();
+    for g in cores {
+        for &c in g {
+            if out.len() >= n {
+                return out;
             }
+            out.insert(c);
         }
     }
-    others
+    out
 }
 
-/// SHA-256 (FIPS 180-4) of a byte string, lowercase hex. Used to key the
-/// stored --tune result to the exact binary that measured it.
+/// `set` plus the SMT siblings of every CPU in it, even outside it.
+pub fn with_siblings(set: &BTreeSet<usize>) -> Vec<usize> {
+    let mut all = set.clone();
+    for &c in set {
+        if let Some(s) = os::siblings_of(c) {
+            all.extend(s);
+        }
+    }
+    all.into_iter().collect()
+}
+
+// ---------------------------------------------------------------------------
+// CPU quota (cgroup cpu.max / cfs_quota on Linux)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Quota {
+    /// CPUs' worth of time per period (quota / period).
+    pub cpus: f64,
+    pub source: String,
+}
+
+impl Quota {
+    /// Worker threads that the quota can keep busy: ceil(quota / period).
+    /// More threads than that only take turns, and are throttled together.
+    pub fn max_workers(&self) -> usize {
+        (self.cpus - 1e-9).ceil().max(1.0) as usize
+    }
+}
+
+/// cgroup v2 `cpu.max`: "<quota> <period>" or "max <period>".
+#[cfg(target_os = "linux")]
+pub fn parse_cpu_max(s: &str) -> Option<f64> {
+    let mut it = s.split_whitespace();
+    let q = it.next()?;
+    let p: f64 = it.next().and_then(|p| p.parse().ok()).unwrap_or(100_000.0);
+    if q == "max" || p <= 0.0 {
+        return None;
+    }
+    let q: f64 = q.parse().ok()?;
+    (q > 0.0).then(|| q / p)
+}
+
+/// cgroup v1 `cpu.cfs_quota_us` / `cpu.cfs_period_us` (-1 = no limit).
+#[cfg(target_os = "linux")]
+pub fn parse_cfs(quota: &str, period: &str) -> Option<f64> {
+    let q: i64 = quota.trim().parse().ok()?;
+    let p: i64 = period.trim().parse().ok()?;
+    (q > 0 && p > 0).then(|| q as f64 / p as f64)
+}
+
+// ---------------------------------------------------------------------------
+// SHA-256 of the running binary (keys the stored --tune result)
+// ---------------------------------------------------------------------------
+
+/// SHA-256 (FIPS 180-4) of a byte string, lowercase hex.
 pub fn sha256_hex(data: &[u8]) -> String {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98,
@@ -332,31 +258,15 @@ pub fn sha256_hex(data: &[u8]) -> String {
     h.iter().map(|x| format!("{x:08x}")).collect()
 }
 
-/// SHA-256 of the running binary (`/proc/self/exe`), cached.
+/// SHA-256 of the running binary, cached.
 pub fn self_sha256() -> String {
     static SHA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SHA.get_or_init(|| fs::read("/proc/self/exe").map(|b| sha256_hex(&b)).unwrap_or_else(|_| "unknown".into())).clone()
+    SHA.get_or_init(|| os::exe_bytes().map(|b| sha256_hex(&b)).unwrap_or_else(|_| "unknown".into())).clone()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const SMAPS: &str = "\
-7f0000000000-7f0000001000 ---p 00000000 00:00 0
-Size:                  4 kB
-AnonHugePages:         0 kB
-7f0000200000-7f0000400000 rw-p 00000000 00:00 0
-Size:               2048 kB
-Rss:                2048 kB
-AnonHugePages:      2048 kB
-THPeligible:           1
-7f0000400000-7f00005ff000 rw-p 00000000 00:00 0
-Size:               2044 kB
-AnonHugePages:         0 kB
-7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0                          [stack]
-Size:                132 kB
-";
 
     #[test]
     fn sha256_known_vectors() {
@@ -366,41 +276,34 @@ Size:                132 kB
         assert_eq!(sha256_hex(m), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn smaps_parser_fixture() {
-        // Inside the huge VMA, at its start and in the middle.
-        assert_eq!(smaps_anon_huge_kb(SMAPS, 0x7f00_0020_0000), Some(2048));
-        assert_eq!(smaps_anon_huge_kb(SMAPS, 0x7f00_0030_0000), Some(2048));
-        // The VMA right after it is someone else's: 0, not ours.
-        assert_eq!(smaps_anon_huge_kb(SMAPS, 0x7f00_0040_0000), Some(0));
-        // A VMA without an AnonHugePages line reads 0.
-        assert_eq!(smaps_anon_huge_kb(SMAPS, 0x7ffd_0000_0000), Some(0));
-        // An address in no VMA.
-        assert_eq!(smaps_anon_huge_kb(SMAPS, 0x1000), None);
+    fn quota_parsers_and_worker_cap() {
+        assert_eq!(parse_cpu_max("max 100000"), None);
+        assert_eq!(parse_cpu_max("384000 100000"), Some(3.84));
+        assert_eq!(parse_cpu_max("200000 100000\n"), Some(2.0));
+        assert_eq!(parse_cfs("-1", "100000"), None);
+        assert_eq!(parse_cfs("150000\n", "100000\n"), Some(1.5));
+        let q = |c| Quota { cpus: c, source: String::new() };
+        // Measured on rented machines: 112 threads for a quota of 13.4 CPUs.
+        assert_eq!(q(13.44).max_workers(), 14);
+        assert_eq!(q(3.84).max_workers(), 4);
+        assert_eq!(q(2.0).max_workers(), 2, "an exact quota is not rounded up");
+        assert_eq!(q(0.5).max_workers(), 1);
     }
 
     #[test]
-    fn cpu_ticks_reads_only_the_named_cpus() {
-        let stat = "cpu  100 0 100 800 0 0 0 0 0 0\n\
-                    cpu0 10 1 5 80 4 1 1 0 0 0\n\
-                    cpu1 50 0 0 50 0 0 0 0 0 0\n\
-                    intr 12345\n";
-        // cpu0: busy 10+1+5+1+1+0 = 18, total 18+80+4 = 102.
-        assert_eq!(cpu_ticks_in(stat, &[0]), Some((18, 102)));
-        assert_eq!(cpu_ticks_in(stat, &[0, 1]), Some((68, 202)));
-        assert_eq!(cpu_ticks_in(stat, &[7]), None, "a CPU absent from /proc/stat reads nothing");
-        assert!(cpu_ticks(&[0]).is_some() && self_ticks().is_some());
+    fn take_logical_fills_whole_cores_first() {
+        let cores = vec![vec![0, 8], vec![1, 9], vec![2, 10]];
+        assert_eq!(take_logical(&cores, 4), [0, 8, 1, 9].into_iter().collect());
+        assert_eq!(take_logical(&cores, 3), [0, 8, 1].into_iter().collect());
+        assert_eq!(take_logical(&cores, 99).len(), 6);
     }
 
     #[test]
-    fn region_is_its_own_vma_and_huge_when_thp_allows() {
-        let r = Region::new(1, true).expect("map");
-        assert_eq!(r.expected_huge_kb(), 2048);
-        let kb = r.huge_kb().expect("smaps readable");
-        // THP may be off where the tests run; the VMA must still be found and
-        // hold no more than the advised span.
-        assert!(kb <= r.expected_huge_kb(), "{kb} KiB counted: the VMA merged with a neighbour");
-        let r4 = Region::new(2, false).expect("map");
-        assert_eq!(r4.huge_kb(), Some(0));
+    fn cpuid_reads_a_vendor_and_a_family() {
+        let id = cpuid();
+        assert!(!id.vendor.is_empty());
+        assert!(id.family >= 6, "family {}", id.family);
     }
 }

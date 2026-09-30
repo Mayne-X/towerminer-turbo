@@ -1,28 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 // Portions derived from jetsam-extminer (Apache-2.0, the Jetsam developers).
-//! # towerminer — TowerWalk CPU miner for Jetsam
+//! # towerminer — TowerWalk CPU miner for Jetsam (JTM)
 //!
 //! Speaks exactly the protocol of `jetsam-extminer` (getBlockTemplate /
 //! submitBlock, Bearer key, pool `nonce_prefix` in bits 96..128, a per-process
-//! offset in bits 64..96, one second of submit margin), so it drops in front of
-//! a node or of our pool unchanged. What differs is the engine:
+//! offset in bits 64..96, one second of submit margin), so it runs against a
+//! Jetsam node in `--mode extminer` or a compatible pool unchanged. What
+//! differs is the engine:
 //!
-//! - persistent pinned worker threads, each owning its pads in 2 MiB pages and
+//! - persistent pinned worker threads, each owning its pads in huge pages and
 //!   grinding the current job without a per-template rayon pass;
 //! - several nonces walked in lockstep per thread (see `walk.rs`);
-//! - a profile chosen from the L2 size the kernel reports, not a model name;
+//! - a profile chosen from the CPU family, the L2 size and the SMT layout the
+//!   kernel reports, not a model name;
 //! - every solution re-verified by the reference walk before it is submitted,
-//!   a sentinel hash re-checked every 4096, a golden self-test at start-up;
-//! - a thermal guard on its own thread (see `thermal.rs`): readings every
-//!   250 ms, stop at 81 C or earlier when the slope projects 82 C (house rule).
+//!   a sentinel hash re-checked every 4096, a golden self-test at start-up.
+//!
+//! The thermal-guard build (`--features fleet`, Linux) adds a thermal guard on
+//! its own thread (`guard.rs`); the default build has none.
 mod gate;
+#[cfg(feature = "fleet")]
+mod guard;
+#[cfg(target_os = "linux")]
 mod rapl;
+#[cfg(not(target_os = "linux"))]
+#[path = "rapl_none.rs"]
+mod rapl;
+mod status;
 mod sys;
 mod thermal;
 mod walk;
 
+#[cfg(all(feature = "fleet", not(target_os = "linux")))]
+compile_error!("the thermal-guard build (--features fleet) reads Linux hwmon sensors: it is Linux only");
+
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -34,20 +47,21 @@ use jetsam_poseidon2b::batch::FixedFieldNonceBatch;
 use jetsam_poseidon2b::native::domain::TAG_POWHDR;
 use jetsam_poseidon2b::towerwalk::Scratch;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use gate::{FIELDS, NONCE_FIELD};
+use status::{exit_once, red};
 use thermal::Thermal;
 use walk::{walk_dyn, MAX_PADS};
 
 const VERSION: &str = concat!("towerminer/", env!("CARGO_PKG_VERSION"));
 const SUBMIT_MARGIN: Duration = Duration::from_secs(1);
 /// HTTP timeout of a block submission. The answer can legitimately take long:
-/// the pool holds the request up to ~10 s (its own retries to the node), and
+/// a pool may hold the request up to ~10 s (its own retries to the node), and
 /// the node up to 30 s, since it finishes its proof before it seals the
-/// block. v0.2.1 (5 s, one retry) printed "no answer" then "refused" for
-/// blocks reported accepted on the pool side [2026-09-30; the pair is in the
-/// cpu2 miner log]. One attempt only: the pool retries on its side, and a
-/// duplicate submission is harmful.
+/// block. A 5 s timeout with one retry printed "no answer" then "refused" for
+/// blocks the pool reported accepted [2026-09-30]. One attempt only: the pool
+/// retries on its side, and a duplicate submission is harmful.
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(45);
 /// Submissions in flight at once, each on its own thread: a second block found
 /// while the first one waits for its answer goes out at once.
@@ -60,36 +74,36 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 /// --tune: a candidate is `noisy` when other processes kept the targeted CPUs
 /// busier than this (fraction), before or during its window.
 const TUNE_FOREIGN_MAX: f64 = 0.05;
+/// --status-json: one `status` event this often.
+const STATUS_EVERY: Duration = Duration::from_secs(5);
 const NONCE_REGION_SHIFT: u32 = 96;
 const SPONGE_BATCH: usize = 256;
 const SENTINEL_EVERY: u64 = 4096;
 const EXIT_SELFTEST: i32 = 2;
 const EXIT_DIVERGED: i32 = 3;
 const EXIT_NO_HUGE: i32 = 4;
-/// Default period of the duty-cycle gate. 1 s: the on-phases are long enough
-/// for the package power limiter to hold the all-core V/f point, not the
-/// burst boost of cores just out of idle [MEASURED 2026-09-28, 5950X, target
-/// 56 C: 97.9 H/J at 1 s vs 90.4 at 500 ms and ~60 at 100 ms].
-const DEFAULT_PWM_MS: u64 = 1000;
 
 /// `--version`: a mutant build (gate self-check) can never pass for a release.
 const VERSION_LONG: &str = if walk::MUTANT {
     concat!(env!("CARGO_PKG_VERSION"), "+mutant")
+} else if cfg!(feature = "fleet") {
+    concat!(env!("CARGO_PKG_VERSION"), "+fleet")
 } else {
     env!("CARGO_PKG_VERSION")
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "towerminer", version = VERSION_LONG, about = "TowerWalk CPU miner for Jetsam")]
+#[command(name = "towerminer", version = VERSION_LONG, about = "TowerWalk CPU miner for Jetsam (JTM)")]
 struct Cli {
-    /// JSON-RPC endpoint of the Jetsam node or pool.
+    /// JSON-RPC endpoint: your Jetsam node (--mode extminer) or a pool.
     #[arg(long, default_value = "http://127.0.0.1:9701", value_name = "URL")]
     rpc: String,
-    /// Bearer token (pool key or node --mining-key).
+    /// Bearer token: the node's --mining-key, or your pool key.
     #[arg(long, value_name = "TOKEN", env = "TOWERMINER_KEY", hide_env_values = true)]
     key: Option<String>,
-    /// Custom coinbase (node must run --allow-custom-coinbase). Empty = node payout.
-    #[arg(long, default_value = "")]
+    /// Payout address (j1...) for the blocks this miner finds; the node must
+    /// run --allow-custom-coinbase. Empty = the node's own payout.
+    #[arg(long, default_value = "", value_name = "ADDRESS")]
     coinbase: String,
     /// CPUs this miner may use (e.g. 0-11,24-35). Default: the process affinity.
     #[arg(long, value_name = "LIST")]
@@ -97,16 +111,18 @@ struct Cli {
     /// CPUs to leave alone (removed from --cpus / the affinity).
     #[arg(long, value_name = "LIST")]
     exclude_cpus: Option<String>,
-    /// Worker threads per physical core: 1 or 2. Default from the L2 size.
+    /// Worker threads per physical core: 1 or 2. Default from the profile.
     #[arg(long)]
     threads_per_core: Option<usize>,
-    /// Cap on worker threads (after the per-core choice).
-    #[arg(long)]
+    /// Logical CPUs to use, whole cores first (both SMT siblings of a core,
+    /// then the next core); the profile (threads per core, pads) applies
+    /// inside them. Default: every allowed CPU.
+    #[arg(long, value_name = "N")]
     threads: Option<usize>,
-    /// Nonces walked together per thread, 1..=4. Default from the L2 size.
+    /// Nonces walked together per thread, 1..=4. Default from the profile.
     #[arg(long)]
     pads: Option<usize>,
-    /// Software prefetch of the next address: 0 or 1. Default from the L2 size.
+    /// Software prefetch of the next address: 0 or 1. Default from the profile.
     #[arg(long)]
     prefetch: Option<u8>,
     /// Walk kernel: base (v0.1) or fast (measured levers: byte-offset
@@ -123,12 +139,12 @@ struct Cli {
     /// the current seed's walk folds. auto = on at 1 pad with the fast kernel.
     #[arg(long, value_enum, default_value_t = PipeArg::Auto)]
     pipe: PipeArg,
-    /// Use 4 KiB pages instead of transparent 2 MiB pages (diagnostic).
+    /// Use 4 KiB pages instead of huge pages (diagnostic).
     #[arg(long)]
     no_huge: bool,
-    /// Exit 4 unless every worker's pads really sit in 2 MiB pages (checked
-    /// per worker in /proc/self/smaps). Default: a red warning and " 4K!" in
-    /// the CPU line the pool shows.
+    /// Exit 4 unless every worker's pads really sit in huge pages (2 MiB THP
+    /// on Linux, checked per worker in /proc/self/smaps; large pages on
+    /// Windows). Default: a warning, and " 4K!" in the CPU line the pool shows.
     #[arg(long, conflicts_with = "no_huge")]
     require_huge: bool,
     /// Milliseconds between template polls.
@@ -136,9 +152,72 @@ struct Cli {
     /// faster halves the work spent on a dead parent for almost no cost.
     #[arg(long, default_value_t = 250)]
     poll_ms: u64,
+    #[cfg(feature = "fleet")]
+    #[command(flatten)]
+    guard: GuardArgs,
+    /// Print a progress line every N seconds (mining default 15; bench: off).
+    #[arg(long, value_name = "SECONDS")]
+    report_secs: Option<u64>,
+    /// Measure the walk rate for N seconds with the chosen profile and exit.
+    #[arg(long, value_name = "SECONDS")]
+    bench_walk: Option<u64>,
+    /// Measure the candidate profiles on THIS machine (N seconds each, two
+    /// alternating rounds), keep the fastest, and remember it for later runs.
+    #[arg(long, value_name = "SECONDS")]
+    tune: Option<u64>,
+    /// Where --tune stores its result (default ~/.config/towerminer/tune.json
+    /// on Linux, %APPDATA%\towerminer\tune.json on Windows).
+    #[arg(long, value_name = "FILE")]
+    tune_file: Option<String>,
+    /// --tune: store the result even when a candidate was measured on noisy
+    /// CPUs (other processes kept the targeted CPUs, SMT siblings included,
+    /// more than 5 % busy).
+    #[arg(long)]
+    tune_force: bool,
+    /// Ignore a stored --tune result and use the built-in table.
+    #[arg(long)]
+    no_tune_file: bool,
+    /// Which profile to load: the fastest (hashrate) or the most hashes per
+    /// joule (efficiency), from the --tune file or the built-in table.
+    #[arg(long, value_enum, default_value_t = Policy::Hashrate)]
+    policy: Policy,
+    /// --tune: kernels to try on every shape (comma list: fast, base).
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "fast")]
+    tune_kernels: Vec<KernelArg>,
+    /// --bench-walk: seconds of idle package power measured before the
+    /// workers start (0 = skip; the marginal H/J needs it; Linux RAPL only).
+    #[arg(long, default_value_t = 3)]
+    idle_secs: u64,
+    /// Run the full bit-exact gate (all kernel shapes) and exit 0/1.
+    #[arg(long)]
+    gate: bool,
+    /// Check this machine (CPU backend, caches, huge pages, CPU quota) and
+    /// exit 0 (ready) or 1.
+    #[arg(long)]
+    check_hardware: bool,
+    /// Random seeds added to --gate on top of the 256 golden vectors.
+    #[arg(long, default_value_t = 1000)]
+    gate_random: usize,
+    /// Nonce-accounting gate: mine a permissive dummy target for N seconds
+    /// with the chosen profile; every solution is recomputed from its nonce
+    /// through the real seed path and the reference walk; duplicates and
+    /// nonces outside the region are counted. Exit 0/1.
+    #[arg(long, value_name = "SECONDS")]
+    check_nonces: Option<u64>,
+    /// Machine-readable events on stdout, one JSON object per line: profile
+    /// at start, status every 5 s, block for every submitted solution, error
+    /// before a fatal exit. The human log stays on stderr.
+    #[arg(long)]
+    status_json: bool,
+}
+
+/// Thermal-guard options (thermal-guard build only).
+#[cfg(feature = "fleet")]
+#[derive(clap::Args, Debug)]
+struct GuardArgs {
     /// Hard thermal stop (C): exit 82 when max(Tctl, Tccd*) reaches it, or
     /// earlier when the last second's slope projects 82 C within one second.
-    /// Cannot be raised above 82 (house rule).
+    /// Cannot be raised above 82.
     #[arg(long, default_value_t = 81.0, value_parser = parse_temp_stop)]
     temp_stop: f64,
     /// Target temperature (C) of the duty-cycle regulator. Default
@@ -155,7 +234,7 @@ struct Cli {
     no_thermal_guard: bool,
     /// Period of the duty-cycle gate (ms). All workers hash during the first
     /// `duty x period` and sleep the rest, in phase.
-    #[arg(long, default_value_t = DEFAULT_PWM_MS, value_parser = clap::value_parser!(u64).range(10..=2000))]
+    #[arg(long, default_value_t = guard::DEFAULT_PWM_MS, value_parser = clap::value_parser!(u64).range(10..=2000))]
     pwm_period_ms: u64,
     /// Floor of the duty cycle (0.05..1).
     #[arg(long, default_value_t = 0.10)]
@@ -174,9 +253,6 @@ struct Cli {
     /// DEPRECATED, ignored: replaced by --temp-target.
     #[arg(long, hide = true)]
     temp_resume: Option<f64>,
-    /// Print a progress line every N seconds (mining default 15; bench: off).
-    #[arg(long, value_name = "SECONDS")]
-    report_secs: Option<u64>,
     /// Test hook: the thermal guard sleeps S seconds once, 5 s after start.
     #[arg(long, hide = true, value_name = "S")]
     debug_guard_stall: Option<f64>,
@@ -186,54 +262,9 @@ struct Cli {
     /// Test hook: behave as if no temperature sensor existed.
     #[arg(long, hide = true)]
     debug_no_sensor: bool,
-    /// Measure the walk rate for N seconds with the chosen profile and exit.
-    #[arg(long, value_name = "SECONDS")]
-    bench_walk: Option<u64>,
-    /// Measure the candidate profiles on THIS machine (N seconds each, two
-    /// alternating rounds), keep the fastest, and remember it for later runs.
-    #[arg(long, value_name = "SECONDS")]
-    tune: Option<u64>,
-    /// Where --tune stores its result (default ~/.config/towerminer/tune.json).
-    #[arg(long, value_name = "FILE")]
-    tune_file: Option<String>,
-    /// --tune: store the result even when a candidate was measured on noisy
-    /// CPUs (other processes kept the targeted CPUs, SMT siblings included,
-    /// more than 5 % busy).
-    #[arg(long)]
-    tune_force: bool,
-    /// Ignore a stored --tune result and use the built-in table.
-    #[arg(long)]
-    no_tune_file: bool,
-    /// Which profile to load: the fastest (hashrate) or the most hashes per
-    /// joule (efficiency), from the --tune file or the built-in table.
-    #[arg(long, value_enum, default_value_t = Policy::Hashrate)]
-    policy: Policy,
     /// --tune: cool below this temperature (C) before each candidate.
     #[arg(long, default_value_t = 60.0)]
     tune_cool: f64,
-    /// --tune: kernels to try on every shape (comma list: fast, base).
-    #[arg(long, value_enum, value_delimiter = ',', default_value = "fast")]
-    tune_kernels: Vec<KernelArg>,
-    /// --bench-walk: seconds of idle package power measured before the
-    /// workers start (0 = skip; the marginal H/J needs it).
-    #[arg(long, default_value_t = 3)]
-    idle_secs: u64,
-    /// Run the full bit-exact gate (all kernel shapes) and exit 0/1.
-    #[arg(long)]
-    gate: bool,
-    /// Check this machine (CPU backend, caches, THP, a 2 MiB region, the
-    /// temperature sensor, RAPL, glibc) and exit 0 (ready) or 1.
-    #[arg(long)]
-    check_hardware: bool,
-    /// Random seeds added to --gate on top of the 256 golden vectors.
-    #[arg(long, default_value_t = 1000)]
-    gate_random: usize,
-    /// Nonce-accounting gate: mine a permissive dummy target for N seconds
-    /// with the chosen profile; every solution is recomputed from its nonce
-    /// through the real seed path and the reference walk; duplicates and
-    /// nonces outside the region are counted. Exit 0/1.
-    #[arg(long, value_name = "SECONDS")]
-    check_nonces: Option<u64>,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,15 +283,17 @@ enum PipeArg {
     On,
 }
 
+#[cfg(feature = "fleet")]
 fn parse_temp_stop(s: &str) -> std::result::Result<f64, String> {
     let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
     if !(40.0..=thermal::HARD_LIMIT_C).contains(&v) {
-        return Err(format!("must be within 40..={} C (house rule)", thermal::HARD_LIMIT_C));
+        return Err(format!("must be within 40..={} C (hard limit)", thermal::HARD_LIMIT_C));
     }
     Ok(v)
 }
 
-impl Cli {
+#[cfg(feature = "fleet")]
+impl GuardArgs {
     /// Regulator target: explicit, else min(74, stop - 5).
     fn temp_target(&self) -> f64 {
         self.temp_target.unwrap_or_else(|| (self.temp_stop - 5.0).min(74.0))
@@ -269,21 +302,53 @@ impl Cli {
 
 /// Cross-field checks clap cannot express.
 fn validate(cli: &Cli) -> Result<()> {
-    if !(0.05..=1.0).contains(&cli.min_duty) {
-        return Err(anyhow!("--min-duty must be within 0.05..=1"));
+    if cli.threads == Some(0) {
+        return Err(anyhow!("--threads must be at least 1"));
     }
-    if !(0.0..=600.0).contains(&cli.ramp_secs) {
-        return Err(anyhow!("--ramp-secs must be within 0..=600"));
-    }
-    if let Some(t) = cli.temp_target {
-        if t > cli.temp_stop - 5.0 {
-            return Err(anyhow!("--temp-target {t} must be <= --temp-stop - 5 ({})", cli.temp_stop - 5.0));
+    #[cfg(feature = "fleet")]
+    {
+        let g = &cli.guard;
+        if !(0.05..=1.0).contains(&g.min_duty) {
+            return Err(anyhow!("--min-duty must be within 0.05..=1"));
         }
-        if t < 30.0 {
-            return Err(anyhow!("--temp-target {t} is below 30 C"));
+        if !(0.0..=600.0).contains(&g.ramp_secs) {
+            return Err(anyhow!("--ramp-secs must be within 0..=600"));
+        }
+        if let Some(t) = g.temp_target {
+            if t > g.temp_stop - 5.0 {
+                return Err(anyhow!("--temp-target {t} must be <= --temp-stop - 5 ({})", g.temp_stop - 5.0));
+            }
+            if t < 30.0 {
+                return Err(anyhow!("--temp-target {t} is below 30 C"));
+            }
         }
     }
     Ok(())
+}
+
+/// Regulator target of the thermal-guard build (a --tune candidate that ran
+/// hotter is disqualified); none without a guard.
+fn reg_target(_cli: &Cli) -> Option<f64> {
+    #[cfg(feature = "fleet")]
+    {
+        Some(_cli.guard.temp_target())
+    }
+    #[cfg(not(feature = "fleet"))]
+    {
+        None
+    }
+}
+
+/// --tune: cool below this before each candidate (thermal-guard build).
+fn tune_cool(_cli: &Cli) -> Option<f64> {
+    #[cfg(feature = "fleet")]
+    {
+        Some(_cli.guard.tune_cool)
+    }
+    #[cfg(not(feature = "fleet"))]
+    {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -307,14 +372,10 @@ struct Profile {
     /// Where the (threads/core, pads, prefetch) triple came from.
     source: String,
     tune_key: String,
-}
-
-fn cpuinfo_field(name: &str) -> Option<String> {
-    std::fs::read_to_string("/proc/cpuinfo").ok().and_then(|s| {
-        s.lines()
-            .find(|l| l.split(':').next().map(|k| k.trim() == name).unwrap_or(false))
-            .map(|l| l.splitn(2, ':').nth(1).unwrap_or("").trim().to_string())
-    })
+    /// CPU quota of this process (Linux cgroup), if any.
+    quota: Option<sys::Quota>,
+    /// Workers the profile would run without the quota.
+    uncapped: usize,
 }
 
 /// A profile shape: threads per core, pads per thread, prefetch, kernel.
@@ -335,7 +396,11 @@ impl Shape {
     }
 }
 
-/// Built-in table, per CPU family, for each policy.
+/// Built-in table, per CPU family, for each policy. `solo`: the workers will
+/// run one per physical core (no SMT sibling in the CPU set, or a CPU quota
+/// that allows no more workers than there are cores).
+///
+/// AMD rows (family from cpuid, as Linux prints `cpu family`):
 ///
 /// v0.1 shapes [MEASURED 2026-09-26, whole machine, vs the node's own search
 /// path on the same CPUs]: EPYC 7742 (Zen 2, family 23) 2/core, 2 pads,
@@ -354,7 +419,7 @@ impl Shape {
 /// the power (142.8 vs 124.7 H/J, -5 C) [MEASURED]. Elsewhere the efficiency
 /// shape is the rate shape until `--tune` has measured better.
 ///
-/// v0.2.2 [MEASURED 2026-09-30, v0.2.1 binary, fast kernel]:
+/// v0.2.2 [MEASURED 2026-09-30, fast kernel]:
 /// - Zen 4 (7950X3D, 8 cores of CCD1): 2x1x0 = 15.15 / 15.33 kH/s on the
 ///   bench and 15.26-15.31 kH/s mining, vs 1x2x0 (the v0.1 row) = 13.84
 ///   (13.86 mining): 2 threads/core x 1 pad, +10 %. Zen 5 (family 26, 1 MiB
@@ -362,9 +427,47 @@ impl Shape {
 /// - Zen 2 (2x EPYC 7742, 112 cores, under a foreign load, so noisy, but
 ///   the same sign in both passes): 2x1x1 = 56.8 / 57.7 kH/s vs 2x2x1 (the
 ///   v0.1 row) = 54.0 / 52.8: 1 pad instead of 2, +7 %.
-fn table(family: u32, l2_kib: usize, policy: Policy) -> (Shape, &'static str) {
+///
+/// Intel rows (family 6) [MEASURED 2026-09-30, v0.2.2 binary, fast kernel,
+/// `--tune 10` (two passes, H/s of each shape) on 13 rented machines].
+/// Most of them ran under a CPU quota far below their CPU count (cpu.max
+/// 3.84 of 16 CPUs, 13.4 of 112...): there a 1-thread-per-core shape gets a
+/// whole core per CPU-second of quota, which flatters it against 2 threads
+/// per core, so the rows below rest first on the machines without a quota or
+/// nearly full: i7-8700K (11.5 of 12 CPUs), i7-11700F (5.76 of 6), Core
+/// Ultra 9 285K and Xeon Gold 6430 (no cgroup limit). Since v0.3 a quota
+/// caps the workers at ceil(quota) and spreads them one per core, which is
+/// exactly the `solo` situation those quota runs measured.
+/// - `solo` -> 1x2x1. Ultra 9 285K (no SMT, L2 3 MiB, no quota): 1 pad
+///   9.53 / 9.48 / 9.63 kH/s, 2 pads 12.43 / 12.43 / 12.41, 2 pads +
+///   prefetch 14.32 / 14.36 / 14.37: +51 %. Gold 6430 VM (128 vCPUs shown
+///   without SMT, no quota, 20-30 % steal): 1 pad 15.70-15.94, 2 pads
+///   16.19-17.32 (+8 %), prefetch neutral. At one thread per core on the
+///   8700K: 1x2x1 4.28 vs 1x1x0 3.93 (+9 %; 1x2x0 4.86); on the 11700F:
+///   1x2x1 2.37 / 2.17 vs 1x1x0 2.40 / 2.22 (-2 %). Quota runs at one thread
+///   per core, 1x2x1 vs 1x1x0: i7-12700 5.23 / 5.06 vs 3.72 / 3.24,
+///   Gold 6330 4.52 / 4.54 vs 3.46 / 3.37, E5-2670 7.31 / 7.31 vs
+///   5.35 / 5.34, E5-2620 v3 2.76 / 2.27 vs 1.91 / 1.75, Gold 5115
+///   2.08 / 2.03 vs 1.63 / 1.32, i7-13700 4.53 / 4.69 vs 3.29 / 3.45
+///   (+19..+45 %); 1x2x1 was the stored best of every one of these tunes.
+/// - SMT, L2 < 2 MiB -> 2x1x0 (the node shape, unchanged). i7-8700K (L2
+///   256K): 2x1x0 4.95 / 4.95 kH/s, best of 8 shapes (1x2x0 4.86, 2x2x1
+///   4.74, 2x1x1 4.53); i7-11700F (L2 512K): 2x1x0 3.22 / 3.22 = 2x1x1
+///   3.50 / 2.97, 2x2x1 3.25 / 3.13, every 1x shape <= 2.40. Quota runs agree
+///   among the 2-per-core shapes at L2 1.25 MiB: i7-12700 2x1x0 3.46 / 3.40
+///   vs 2x2x0 2.21 / 2.23; Gold 6330 2.40 / 2.44 vs 1.98 / 2.00.
+/// - SMT, L2 >= 2 MiB (Raptor Cove, Sapphire Rapids) -> 2x2x1: four pads
+///   (2 MiB) per core fit the L2. Gold 6430 VM (the host's SMT under the
+///   vCPUs, no quota): 2 pads per vCPU 17.12-17.32 vs 1 pad 15.42-15.94
+///   (+8 %); i7-13700 (quota 3.84 of 16, noisy), among 2-per-core shapes:
+///   2x2x1 3.56 / 3.42 vs 2x1x0 2.89 / 3.02 (+18 %) [DERIVED: no machine
+///   without quota and with visible SMT at L2 >= 2 MiB was measured].
+fn table(intel: bool, family: u32, l2_kib: usize, solo: bool, policy: Policy) -> (Shape, &'static str) {
     const F: u8 = walk::K_FAST;
     match (family, policy) {
+        (6, _) if intel && solo => (Shape::new(1, 2, true, F), "table: Intel, one thread per core"),
+        (6, _) if intel && l2_kib >= 2048 => (Shape::new(2, 2, true, F), "table: Intel, L2 >= 2 MiB"),
+        (6, _) if intel => (Shape::new(2, 1, false, F), "table: Intel"),
         (23, _) => (Shape::new(2, 1, true, F), "table: Zen 2"),
         (25, Policy::Hashrate) if l2_kib < 1024 => (Shape::new(1, 1, false, F), "table: Zen 3"),
         (25, Policy::Efficiency) if l2_kib < 1024 => (Shape::new(2, 2, true, F), "table: Zen 3, efficiency"),
@@ -385,8 +488,7 @@ fn tune_path(cli: &Cli) -> std::path::PathBuf {
     if let Some(p) = &cli.tune_file {
         return p.into();
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    std::path::Path::new(&home).join(".config/towerminer/tune.json")
+    sys::config_dir().join("tune.json")
 }
 
 fn allowed_set(cli: &Cli) -> Result<BTreeSet<usize>> {
@@ -419,13 +521,34 @@ fn allowed_set(cli: &Cli) -> Result<BTreeSet<usize>> {
     Ok(allowed)
 }
 
-/// Key of a stored --tune result: same binary (sha256), same CPU model, same
-/// CPU set, same THP mode. Anything else and the numbers are someone else's.
-fn tune_key(cli: &Cli) -> Result<String> {
+/// The CPU set the workers may use: the allowed set, cut to `--threads N`
+/// logical CPUs (whole cores first).
+fn cpu_set(cli: &Cli) -> Result<(BTreeSet<usize>, sys::Topology)> {
     let allowed = allowed_set(cli)?;
-    let model = cpuinfo_field("model name").unwrap_or_default();
-    let cpu_list: Vec<String> = allowed.iter().map(|c| c.to_string()).collect();
-    Ok(format!("{VERSION}|{model}|{}|thp={}|sha={}", cpu_list.join(","), sys::thp_mode(), sys::self_sha256()))
+    let topo = sys::Topology::detect(&allowed);
+    match cli.threads {
+        Some(n) if n < allowed.len() => {
+            let set = sys::take_logical(&topo.cores, n.max(1));
+            let topo = sys::Topology::detect(&set);
+            Ok((set, topo))
+        }
+        _ => Ok((allowed, topo)),
+    }
+}
+
+/// Key of a stored --tune result: same binary (sha256), same CPU model, same
+/// CPU set, same CPU quota, same page mode. Anything else and the numbers are
+/// someone else's.
+fn tune_key_of(set: &BTreeSet<usize>, cap: Option<usize>) -> String {
+    let cpu_list: Vec<String> = set.iter().map(|c| c.to_string()).collect();
+    format!(
+        "{VERSION}|{}|{}|quota={}|{}|sha={}",
+        sys::cpuid().brand,
+        cpu_list.join(","),
+        cap.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+        sys::page_env(),
+        sys::self_sha256()
+    )
 }
 
 fn shape_of(v: &serde_json::Value) -> Option<Shape> {
@@ -438,14 +561,17 @@ fn shape_of(v: &serde_json::Value) -> Option<Shape> {
 }
 
 /// Build a profile. Precedence: explicit flags > stored --tune result for this
-/// exact binary + CPU model + CPU set + THP mode (best rate or best H/J per
-/// --policy) > built-in table.
+/// exact binary + CPU model + CPU set + quota + page mode (best rate or best
+/// H/J per --policy) > built-in table. A CPU quota caps the workers at
+/// ceil(quota / period), whatever the profile.
 fn profile_with(cli: &Cli, over: Option<Shape>) -> Result<Profile> {
-    let allowed = allowed_set(cli)?;
-    let topo = sys::Topology::detect(&allowed);
-    let family: u32 = cpuinfo_field("cpu family").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let tune_key = tune_key(cli)?;
-    let (mut sh, src) = table(family, topo.l2_kib, cli.policy);
+    let (set, topo) = cpu_set(cli)?;
+    let id = sys::cpuid();
+    let quota = sys::cpu_quota();
+    let cap = quota.as_ref().map(|q| q.max_workers());
+    let solo = !topo.smt() || cap.is_some_and(|c| c <= topo.cores.len());
+    let tune_key = tune_key_of(&set, cap);
+    let (mut sh, src) = table(id.intel(), id.family, topo.l2_kib, solo, cli.policy);
     let mut source = src.to_string();
     if let Some(o) = over {
         sh = o;
@@ -458,16 +584,16 @@ fn profile_with(cli: &Cli, over: Option<Shape>) -> Result<Profile> {
                     if let Some(t) = shape_of(&v[which]) {
                         sh = t;
                         source = format!(
-                            "tune file ({which}: {:.0} H/s, {:.1} H/J, measured {})",
+                            "tune file ({which}: {:.0} H/s, {} H/J, measured {})",
                             v[which]["hps"].as_f64().unwrap_or(0.0),
-                            v[which]["hpj"].as_f64().unwrap_or(0.0),
+                            v[which]["hpj"].as_f64().map(|x| format!("{x:.1}")).unwrap_or_else(|| "n/a".into()),
                             v["measured_utc"].as_str().unwrap_or("?")
                         );
                     }
                 } else if v["key"].is_string() {
                     eprintln!(
-                        "note: {} was measured for another binary, CPU set or THP mode; using the built-in table \
-                         (run --tune again)",
+                        "note: {} was measured for another binary, CPU set, quota or page mode; using the built-in \
+                         table (run --tune again)",
                         tune_path(cli).display()
                     );
                 }
@@ -477,13 +603,16 @@ fn profile_with(cli: &Cli, over: Option<Shape>) -> Result<Profile> {
     if cli.threads_per_core.is_some() || cli.pads.is_some() || cli.prefetch.is_some() || cli.kernel != KernelArg::Auto {
         source = "command line".into();
     }
-    let per_core = cli.threads_per_core.unwrap_or(sh.tpc).clamp(1, 2);
+    // Never more per core than the set has CPUs per core (no SMT, or SMT
+    // hidden by a VM): the label then says what really runs.
+    let smt_width = topo.cores.iter().map(|c| c.len()).max().unwrap_or(1).max(1);
+    let per_core = cli.threads_per_core.unwrap_or(sh.tpc).clamp(1, 2).min(smt_width);
     let pads = cli.pads.unwrap_or(sh.pads);
     if !(1..=MAX_PADS).contains(&pads) {
         return Err(anyhow!("--pads must be 1..={MAX_PADS}"));
     }
     let prefetch = cli.prefetch.map(|v| v != 0).unwrap_or(sh.pf);
-    // Order: first sibling of every core, then second siblings — so a --threads
+    // Order: first sibling of every core, then second siblings — so a quota
     // cap fills physical cores before it doubles up on one.
     let mut cpus = Vec::new();
     for rank in 0..per_core {
@@ -493,8 +622,9 @@ fn profile_with(cli: &Cli, over: Option<Shape>) -> Result<Profile> {
             }
         }
     }
-    if let Some(n) = cli.threads {
-        cpus.truncate(n.max(1));
+    let uncapped = cpus.len();
+    if let Some(c) = cap {
+        cpus.truncate(c);
     }
     let kernel = match cli.kernel {
         KernelArg::Base => walk::K_BASE,
@@ -527,6 +657,8 @@ fn profile_with(cli: &Cli, over: Option<Shape>) -> Result<Profile> {
         policy: cli.policy,
         source,
         tune_key,
+        quota,
+        uncapped,
     })
 }
 
@@ -585,6 +717,8 @@ struct Shared {
     /// Submissions without an answer (transport error, timeout): the block
     /// may or may not have been accepted, so they count as neither.
     unknown: AtomicU64,
+    /// Submissions waiting for their answer.
+    inflight: AtomicUsize,
 }
 
 const HUGE_PENDING: u8 = 0;
@@ -608,11 +742,12 @@ impl Shared {
             accepted: AtomicU64::new(0),
             refused: AtomicU64::new(0),
             unknown: AtomicU64::new(0),
+            inflight: AtomicUsize::new(0),
         }
     }
 
     /// Wait (up to `timeout`) for every worker to report its pages; returns
-    /// (in 2M pages, reported, workers).
+    /// (in huge pages, reported, workers).
     fn huge_status(&self, timeout: Duration) -> (usize, usize, usize) {
         let t = Instant::now();
         loop {
@@ -633,6 +768,7 @@ impl Shared {
 struct Found {
     epoch: u64,
     template_id: String,
+    height: u64,
     nonce: u128,
     digest: [u8; 32],
     t_found: Instant,
@@ -649,8 +785,10 @@ fn le256_lt(a: &[u8; 32], b: &[u8; 32]) -> bool {
 }
 
 fn diverged(what: &str) -> ! {
-    eprintln!("FATAL: kernel diverged from the reference walk ({what}). Not submitting; exiting {EXIT_DIVERGED}.");
-    std::process::exit(EXIT_DIVERGED);
+    exit_once(
+        EXIT_DIVERGED,
+        &format!("FATAL: kernel diverged from the reference walk ({what}). Not submitting; exiting {EXIT_DIVERGED}."),
+    )
 }
 
 /// Nonce layout: `base` (pool region 96..128 | process offset 64..96) |
@@ -668,12 +806,12 @@ fn worker(id: usize, cpu: usize, prof: &Profile, sh: &Shared, tx: mpsc::Sender<F
         // profile's per-core layout (and NUMA placement) no longer holds.
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            eprintln!("\x1b[31mWARNING: cannot pin worker {id} to CPU {cpu} ({e}); workers that fail to pin run unpinned\x1b[0m")
+            eprintln!("{}", red(&format!("WARNING: cannot pin worker {id} to CPU {cpu} ({e}); workers that fail to pin run unpinned")))
         });
     }
     let region = match sys::Region::new(prof.pads, prof.huge) {
         Ok(r) => r,
-        Err(e) => thermal::exit_once(1, &format!("fatal: worker {id}: cannot map its scratchpad region: {e}")),
+        Err(e) => exit_once(1, &format!("fatal: worker {id}: cannot map its scratchpad region: {e}")),
     };
     let state = match region.huge_kb() {
         None => HUGE_UNKNOWN,
@@ -765,6 +903,7 @@ fn worker(id: usize, cpu: usize, prof: &Profile, sh: &Shared, tx: mpsc::Sender<F
                     let _ = tx.send(Found {
                         epoch: job.epoch,
                         template_id: job.template_id.clone(),
+                        height: job.height,
                         nonce: start + k as u128,
                         digest: outs[k],
                         t_found: Instant::now(),
@@ -790,6 +929,7 @@ fn worker(id: usize, cpu: usize, prof: &Profile, sh: &Shared, tx: mpsc::Sender<F
                     let _ = tx.send(Found {
                         epoch: job.epoch,
                         template_id: job.template_id.clone(),
+                        height: job.height,
                         nonce: start + k as u128,
                         digest: *s,
                         t_found: Instant::now(),
@@ -840,8 +980,8 @@ struct Resp<T> {
 struct Rpc {
     url: String,
     key: Option<String>,
-    /// Self-description sent to the pool, so its dashboard names this machine
-    /// without a hand-kept IP table (which goes stale silently).
+    /// Self-description sent to the pool, so its dashboard can name this
+    /// machine.
     host: String,
     cpu: String,
     http: reqwest::blocking::Client,
@@ -911,7 +1051,7 @@ impl Rpc {
             .header("X-Jetsam-PoW", "walk")
             .header("X-Jetsam-Host", &self.host)
             .header("X-Jetsam-CPU", self.cpu_header());
-        let resp = req.send().map_err(|e| CallErr::Transport(format!("POST {}: {e}", self.url)))?;
+        let resp = req.send().map_err(|e| CallErr::Transport(format!("POST {}: {}", self.url, err_chain(&e))))?;
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(CallErr::Answer("401 Unauthorized — wrong or missing --key".into()));
         }
@@ -924,6 +1064,22 @@ impl Rpc {
         }
         body.result.ok_or_else(|| CallErr::Answer("RPC returned null result".into()))
     }
+}
+
+/// An error and its causes, "a: b: c" (reqwest keeps "connection refused"
+/// in the source chain, not in its own message).
+fn err_chain(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut src = e.source();
+    while let Some(c) = src {
+        let m = c.to_string();
+        if !s.contains(&m) {
+            s.push_str(": ");
+            s.push_str(&m);
+        }
+        src = c.source();
+    }
+    s
 }
 
 /// Where a found block goes: the pool/node (`Rpc`), or a test double.
@@ -955,20 +1111,35 @@ fn decode_fields(hex_str: &str) -> Result<[Block128; FIELDS]> {
 // ---------------------------------------------------------------------------
 
 fn banner(prof: &Profile) {
+    let id = sys::cpuid();
     eprintln!(
-        "{VERSION}  backend={}  L2={} KiB  L3={} KiB  THP={}",
+        "{VERSION}  backend={}  L2={} KiB  L3={} KiB  {}",
         jetsam_core::cpu::selected_backend(),
         prof.l2_kib,
         prof.l3_kib,
-        sys::thp_mode()
+        sys::page_env()
     );
+    eprintln!("cpu: {} ({}, family {} model {})", cpu_model(), id.vendor, id.family, id.model);
+    if let Some(q) = &prof.quota {
+        eprintln!(
+            "cpu quota: {:.2} CPUs ({}): at most {} worker threads{}",
+            q.cpus,
+            q.source,
+            q.max_workers(),
+            if prof.uncapped > prof.cpus.len() {
+                format!(" (the profile would run {})", prof.uncapped)
+            } else {
+                String::new()
+            }
+        );
+    }
     eprintln!(
         "profile: {} threads ({} per core)  pads/thread={}  prefetch={}  pages={}  kernel={}  ring={}  policy={:?}  [{}]",
         prof.cpus.len(),
         prof.per_core,
         prof.pads,
         prof.prefetch as u8,
-        if prof.huge { "2M(THP)" } else { "4K" },
+        sys::pages_label(prof.huge),
         walk::describe(prof.kernel, prof.pads, prof.pipe),
         prof.ring_len(),
         prof.policy,
@@ -981,35 +1152,47 @@ fn banner(prof: &Profile) {
     }
 }
 
+/// The default build has no thermal guard: nothing to resolve, no sensor
+/// needed.
+#[cfg(not(feature = "fleet"))]
+fn start_thermal(_cli: &Cli) -> Arc<Thermal> {
+    eprintln!("thermal guard: none (public build)");
+    Arc::new(Thermal::new(Instant::now(), false))
+}
+
 /// Resolve the sensor and start the guard, before any hashing (the self-test
 /// included). No sensor: exit 5, unless --no-thermal-guard.
+#[cfg(feature = "fleet")]
 fn start_thermal(cli: &Cli) -> Arc<Thermal> {
-    let sensor = if cli.debug_no_sensor { None } else { thermal::Sensor::detect() };
+    let g = &cli.guard;
+    let sensor = if g.debug_no_sensor { None } else { guard::Sensor::detect() };
     let t0 = Instant::now();
     match sensor {
-        None if !cli.no_thermal_guard => thermal::exit_once(
-            thermal::EXIT_NO_SENSOR,
-            "\x1b[31mTHERMAL: no CPU temperature sensor found (k10temp / zenpower / coretemp). Refusing to mine \
-             without a thermal guard; pass --no-thermal-guard to run anyway. Exit 5.\x1b[0m",
+        None if !g.no_thermal_guard => exit_once(
+            guard::EXIT_NO_SENSOR,
+            &red(
+                "THERMAL: no CPU temperature sensor found (k10temp / zenpower / coretemp). Refusing to mine without a \
+                 thermal guard; pass --no-thermal-guard to run anyway. Exit 5.",
+            ),
         ),
         None => {
-            eprintln!("\x1b[31mWARNING: --no-thermal-guard: NO temperature sensor, NO thermal protection.\x1b[0m");
+            eprintln!("{}", red("WARNING: --no-thermal-guard: NO temperature sensor, NO thermal protection."));
             Arc::new(Thermal::new(t0, false))
         }
         Some(s) => {
             let th = Arc::new(Thermal::new(t0, true));
             let mining = !cli.gate && cli.bench_walk.is_none() && cli.tune.is_none() && cli.check_nonces.is_none();
-            let regulate = mining || (cli.bench_walk.is_some() && cli.bench_regulate);
-            let cfg = thermal::GuardCfg {
-                stop_c: cli.temp_stop,
-                hard_c: cli.debug_temp_hard.unwrap_or(thermal::HARD_LIMIT_C),
-                poll_ms: cli.temp_poll_ms,
-                stall: cli.debug_guard_stall.map(|s| (5.0, s)),
-                reg: regulate.then(|| thermal::RegCfg {
-                    target_c: cli.temp_target(),
-                    min_duty: cli.min_duty,
-                    period_ms: cli.pwm_period_ms,
-                    ramp_secs: if mining { cli.ramp_secs } else { 0.0 },
+            let regulate = mining || (cli.bench_walk.is_some() && g.bench_regulate);
+            let cfg = guard::GuardCfg {
+                stop_c: g.temp_stop,
+                hard_c: g.debug_temp_hard.unwrap_or(thermal::HARD_LIMIT_C),
+                poll_ms: g.temp_poll_ms,
+                stall: g.debug_guard_stall.map(|s| (5.0, s)),
+                reg: regulate.then(|| guard::RegCfg {
+                    target_c: g.temp_target(),
+                    min_duty: g.min_duty,
+                    period_ms: g.pwm_period_ms,
+                    ramp_secs: if mining { g.ramp_secs } else { 0.0 },
                 }),
             };
             eprintln!(
@@ -1030,7 +1213,7 @@ fn start_thermal(cli: &Cli) -> Arc<Thermal> {
                     None => "regulator: off".into(),
                 }
             );
-            thermal::Guard::start(s, cfg, th.clone());
+            guard::Guard::start(s, cfg, th.clone());
             th
         }
     }
@@ -1061,8 +1244,8 @@ fn fmt_rate(h: f64) -> String {
     }
 }
 
-/// Every worker's pads in 2 MiB pages? Prints the result once; exits 4 under
-/// --require-huge when they are not. Returns (in 2M pages, workers).
+/// Every worker's pads in huge pages? Prints the result once; exits 4 under
+/// --require-huge when they are not. Returns (in huge pages, workers).
 fn check_huge(cli: &Cli, prof: &Profile, sh: &Shared, quiet: bool) -> (usize, usize) {
     let (ok, done, n) = sh.huge_status(Duration::from_secs(2));
     if !prof.huge {
@@ -1073,18 +1256,19 @@ fn check_huge(cli: &Cli, prof: &Profile, sh: &Shared, quiet: bool) -> (usize, us
     }
     if ok == n {
         if !quiet {
-            eprintln!("huge pages: {ok}/{n} workers in 2 MiB pages");
+            eprintln!("huge pages: {ok}/{n} workers in {} pages", sys::pages_label(true));
         }
     } else {
         let msg = format!(
-            "huge pages: only {ok}/{n} workers in 2 MiB pages ({} not reported, THP={}): 4 KiB pads cost ~24 % of the rate",
+            "huge pages: only {ok}/{n} workers in {} pages ({} not reported): {}",
+            sys::pages_label(true),
             n - done,
-            sys::thp_mode()
+            sys::huge_hint()
         );
         if cli.require_huge {
-            thermal::exit_once(EXIT_NO_HUGE, &format!("\x1b[31m{msg}. --require-huge: exit {EXIT_NO_HUGE}.\x1b[0m"));
+            exit_once(EXIT_NO_HUGE, &red(&format!("{msg}. --require-huge: exit {EXIT_NO_HUGE}.")));
         }
-        eprintln!("\x1b[31mWARNING: {msg}\x1b[0m");
+        eprintln!("{}", red(&format!("WARNING: {msg}")));
     }
     (ok, n)
 }
@@ -1092,13 +1276,13 @@ fn check_huge(cli: &Cli, prof: &Profile, sh: &Shared, quiet: bool) -> (usize, us
 #[derive(Default, Clone)]
 struct Measured {
     hps: f64,
-    /// Peak of max(Tctl, Tccd*) during the window.
+    /// Peak of max(Tctl, Tccd*) during the window (thermal-guard build).
     peak_c: f64,
     tctl_max: f64,
     ccd_max: Vec<f64>,
     huge_ok: usize,
     workers: usize,
-    anon_huge_kb: u64,
+    anon_huge_kb: Option<u64>,
     /// Package / core power over the window (RAPL), W.
     w_pkg: Option<f64>,
     w_core: Option<f64>,
@@ -1113,7 +1297,7 @@ struct Measured {
     foreign: Option<f64>,
 }
 
-/// Snapshot for `foreign_share`: busy/total jiffies of the targeted CPUs and
+/// Snapshot for `foreign_share`: busy/total ticks of the targeted CPUs and
 /// this process's own CPU time.
 struct CpuSnap {
     busy: u64,
@@ -1134,17 +1318,12 @@ fn foreign_share(a: &CpuSnap, b: &CpuSnap) -> Option<f64> {
     Some(busy.saturating_sub(own) as f64 / total as f64)
 }
 
-/// The CPUs whose load can bias a --tune measurement: the allowed set plus
-/// the SMT siblings of every allowed CPU, even outside the set — a neighbour
-/// on a sibling slows the core as much as one on the CPU itself.
+/// The CPUs whose load can bias a --tune measurement: the CPU set plus the
+/// SMT siblings of every CPU in it, even outside it — a neighbour on a
+/// sibling slows the core as much as one on the CPU itself.
 fn targeted_cpus(cli: &Cli) -> Vec<usize> {
-    let mut set = allowed_set(cli).unwrap_or_default();
-    for c in set.clone() {
-        if let Ok(s) = std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list")) {
-            set.extend(sys::parse_list(&s));
-        }
-    }
-    set.into_iter().collect()
+    let set = cpu_set(cli).map(|(s, _)| s).unwrap_or_default();
+    sys::with_siblings(&set)
 }
 
 impl Measured {
@@ -1164,10 +1343,10 @@ fn opt(v: Option<f64>, prec: usize) -> String {
 }
 
 /// Walk rate of `prof` on a dummy job, after a 2 s warm-up (pads faulted,
-/// THP collapsed), with package power (RAPL, 1 Hz), temperatures and the mean
-/// clock over the window. `idle_secs` > 0 first measures the idle package
-/// power (marginal H/J). The thermal guard runs throughout (it exits the
-/// process at the stop temperature).
+/// huge pages collapsed), with package power (RAPL, 1 Hz), temperatures and
+/// the mean clock over the window. `idle_secs` > 0 first measures the idle
+/// package power (marginal H/J). In the thermal-guard build the guard runs
+/// throughout (it exits the process at the stop temperature).
 fn measure(
     cli: &Cli,
     th: &Arc<Thermal>,
@@ -1352,7 +1531,11 @@ fn check_nonces(cli: &Cli, th: &Arc<Thermal>, prof: Arc<Profile>, secs: u64) -> 
 fn open_rapl() -> Option<rapl::Rapl> {
     let r = rapl::Rapl::open();
     if r.is_none() {
-        eprintln!("note: RAPL energy counters not readable (root or passwordless sudo needed): rapl=n/a");
+        if cfg!(target_os = "linux") {
+            eprintln!("note: RAPL energy counters not readable (root or passwordless sudo needed): rapl=n/a");
+        } else {
+            eprintln!("note: package power is not measured on this platform: rapl=n/a");
+        }
     }
     r
 }
@@ -1362,15 +1545,16 @@ fn run_bench(cli: &Cli, th: &Arc<Thermal>, prof: Arc<Profile>, secs: u64) {
     let m = measure(cli, th, rapl.as_ref(), prof.clone(), secs, cli.idle_secs, false);
     let cores = prof.cpus.len().div_ceil(prof.per_core);
     let ccd: Vec<String> = m.ccd_max.iter().map(|c| format!("{c:.1}")).collect();
+    let temp = |v: f64| if th.guarded { format!("{v:.1}") } else { "n/a".into() };
     println!(
         "BENCH-WALK threads={} ({}/core) pads={} prefetch={} pages={} kernel={} ring={} : {} ({:.1} H/s per thread)  \
-         hps={:.1}  W_pkg={}  W_core={}  W_min={}  W_max={}  W_idle={}  HpJ={}  HpJ_marg={}  Tctl_max={:.1}  Tccd={}  \
-         peak={:.1}  f_avg={}  cyc_per_hash={}  huge={}/{}  anon_huge={}KiB  rapl={}  guard={}",
+         hps={:.1}  W_pkg={}  W_core={}  W_min={}  W_max={}  W_idle={}  HpJ={}  HpJ_marg={}  Tctl_max={}  Tccd={}  \
+         peak={}  f_avg={}  cyc_per_hash={}  huge={}/{}  anon_huge={}  rapl={}  guard={}",
         prof.cpus.len(),
         prof.per_core,
         prof.pads,
         prof.prefetch as u8,
-        if prof.huge { "2M" } else { "4K" },
+        sys::pages_label(prof.huge && m.huge_ok == m.workers),
         walk::describe(prof.kernel, prof.pads, prof.pipe),
         prof.ring_len(),
         fmt_rate(m.hps),
@@ -1383,17 +1567,23 @@ fn run_bench(cli: &Cli, th: &Arc<Thermal>, prof: Arc<Profile>, secs: u64) {
         opt(m.w_idle, 1),
         opt(m.hpj(), 2),
         opt(m.hpj_marg(), 2),
-        m.tctl_max,
+        temp(m.tctl_max),
         if ccd.is_empty() { "n/a".into() } else { ccd.join("/") },
-        m.peak_c,
+        temp(m.peak_c),
         opt(m.f_avg, 0),
         // Core cycles per hash [derived]: mean clock x cores / rate.
         m.f_avg.map(|f| format!("{:.2}M", f * 1e6 * cores as f64 / m.hps / 1e6)).unwrap_or_else(|| "n/a".into()),
         m.huge_ok,
         m.workers,
-        m.anon_huge_kb,
+        m.anon_huge_kb.map(|k| format!("{k}KiB")).unwrap_or_else(|| "n/a".into()),
         rapl.as_ref().map(|r| r.mode.name()).unwrap_or("n/a"),
-        if th.guarded { "ok" } else { "OFF" }
+        if th.guarded {
+            "ok"
+        } else if cfg!(feature = "fleet") {
+            "OFF"
+        } else {
+            "none"
+        }
     );
 }
 
@@ -1413,7 +1603,8 @@ fn utc_now() -> String {
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", s / 3600, (s / 60) % 60, s % 60)
 }
 
-fn cool_below(th: &Thermal, c: f64, max_secs: u64) {
+fn cool_below(th: &Thermal, c: Option<f64>, max_secs: u64) {
+    let Some(c) = c else { return };
     let mut w = 0;
     while th.guarded && th.temp_c() >= c && w < max_secs {
         std::thread::sleep(Duration::from_secs(1));
@@ -1423,17 +1614,18 @@ fn cool_below(th: &Thermal, c: f64, max_secs: u64) {
 
 /// Try the candidate shapes (x kernels) on this machine; keep the fastest and
 /// the most efficient. Two rounds in alternating order so a slow drift (heat,
-/// a neighbour) cannot favour whichever candidate ran first; every candidate
-/// starts below --tune-cool. A candidate that got hotter than the regulator
-/// target is disqualified: its number measures the cooler, not the kernel.
-/// The regulator is off here (the stop still applies).
+/// a neighbour) cannot favour whichever candidate ran first. In the
+/// thermal-guard build every candidate starts below --tune-cool, and a
+/// candidate that got hotter than the regulator target is disqualified: its
+/// number measures the cooler, not the kernel (the regulator is off here; the
+/// stop still applies).
 ///
-/// Other processes on the targeted CPUs (the allowed set and its SMT
-/// siblings) are measured 2 s before each candidate (workers stopped) and
-/// during it (busy time minus our own): a
-/// candidate that saw more than 5 % is `noisy`, and then the result is NOT
-/// stored unless --tune-force — a noisy tune would pin a wrong profile for
-/// every later run.
+/// Other processes on the targeted CPUs (the CPU set and its SMT siblings;
+/// the whole machine on Windows) are measured 2 s before each candidate
+/// (workers stopped) and during it (busy time minus our own): a candidate
+/// that saw more than 5 % is `noisy`, and then the result is NOT stored
+/// unless --tune-force — a noisy tune would pin a wrong profile for every
+/// later run.
 fn run_tune(cli: &Cli, th: &Arc<Thermal>, secs: u64) -> Result<()> {
     let base = profile(cli)?;
     let targets = targeted_cpus(cli);
@@ -1452,8 +1644,9 @@ fn run_tune(cli: &Cli, th: &Arc<Thermal>, secs: u64) -> Result<()> {
     let cands: Vec<Shape> =
         shapes.iter().flat_map(|&(t, p, f)| kernels.iter().map(move |&k| Shape::new(t, p, f, k))).collect();
     let rapl = open_rapl();
+    let cool = tune_cool(cli);
     // Idle power once, cool machine, before any candidate.
-    cool_below(th, cli.tune_cool, 300);
+    cool_below(th, cool, 300);
     let w_idle = rapl.as_ref().and_then(|r| {
         let a = r.sample()?;
         std::thread::sleep(Duration::from_secs(cli.idle_secs.max(1)));
@@ -1463,26 +1656,27 @@ fn run_tune(cli: &Cli, th: &Arc<Thermal>, secs: u64) -> Result<()> {
     let mut hot = vec![false; cands.len()];
     // Highest foreign share seen per candidate (before or during, both rounds).
     let mut foreign: Vec<Option<f64>> = vec![None; cands.len()];
+    eprintln!("tune: {} candidates x 2 rounds x {secs} s; foreign load measured on {}", cands.len(), sys::FOREIGN_SCOPE);
     for round in 0..2 {
         let order: Vec<usize> = if round == 0 { (0..cands.len()).collect() } else { (0..cands.len()).rev().collect() };
         for i in order {
             let p = Arc::new(profile_with(cli, Some(cands[i]))?);
-            cool_below(th, cli.tune_cool, 300);
+            cool_below(th, cool, 300);
             let before = cpu_snap(&targets).and_then(|a| {
                 std::thread::sleep(Duration::from_secs(2));
                 foreign_share(&a, &cpu_snap(&targets)?)
             });
             let m = measure(cli, th, rapl.as_ref(), p.clone(), secs, 0, true);
-            let over = m.peak_c > cli.temp_target();
+            let over = reg_target(cli).is_some_and(|t| m.peak_c > t);
             let f = [before, m.foreign].into_iter().flatten().reduce(f64::max);
-            let noisy = f.map_or(false, |x| x > TUNE_FOREIGN_MAX);
+            let noisy = f.is_some_and(|x| x > TUNE_FOREIGN_MAX);
             eprintln!(
-                "tune  {:<12} {:>10}  {:>6} W  {:>7} H/J  peak {:.0} C  foreign {} / {} %{}{}",
+                "tune  {:<12} {:>10}  {:>6} W  {:>7} H/J  peak {}  foreign {} / {} %{}{}",
                 cands[i].label(),
                 fmt_rate(m.hps),
                 opt(m.w_pkg, 1),
                 opt(m.hpj(), 2),
-                m.peak_c,
+                if th.guarded { format!("{:.0} C", m.peak_c) } else { "n/a".into() },
                 opt(before.map(|x| x * 100.0), 1),
                 opt(m.foreign.map(|x| x * 100.0), 1),
                 if noisy { "  NOISY" } else { "" },
@@ -1493,7 +1687,7 @@ fn run_tune(cli: &Cli, th: &Arc<Thermal>, secs: u64) -> Result<()> {
             foreign[i] = [foreign[i], f].into_iter().flatten().reduce(f64::max);
         }
     }
-    let noisy: Vec<bool> = foreign.iter().map(|f| f.map_or(false, |x| x > TUNE_FOREIGN_MAX)).collect();
+    let noisy: Vec<bool> = foreign.iter().map(|f| f.is_some_and(|x| x > TUNE_FOREIGN_MAX)).collect();
     // Spread of the two passes: sample coefficient of variation of the rate.
     let cv: Vec<Option<f64>> = res
         .iter()
@@ -1528,7 +1722,7 @@ fn run_tune(cli: &Cli, th: &Arc<Thermal>, secs: u64) -> Result<()> {
     let entry = |i: usize| {
         let c = cands[i];
         let p = profile_with(cli, Some(c)).ok();
-        serde_json::json!({
+        json!({
             "tpc": c.tpc, "pads": c.pads, "pf": c.pf, "kernel": walk::kernel_name(c.kernel),
             "ring": p.as_ref().map(|p| p.ring_len()), "pipe": p.as_ref().map(|p| p.pipe),
             "hps": hps[i].round(), "w": w[i].map(|x| (x * 10.0).round() / 10.0),
@@ -1540,7 +1734,7 @@ fn run_tune(cli: &Cli, th: &Arc<Thermal>, secs: u64) -> Result<()> {
         })
     };
     let any_noisy = noisy.iter().any(|&n| n);
-    let v = serde_json::json!({
+    let v = json!({
         "version": 3,
         "key": base.tune_key,
         "best_hps": entry(best_hps),
@@ -1599,14 +1793,16 @@ fn header_safe(s: &str, max: usize) -> String {
 }
 
 fn cpu_model() -> String {
-    std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|s| s.lines().find(|l| l.starts_with("model name")).map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string()))
-        .unwrap_or_else(|| "unknown CPU".into())
-        .replace("AMD ", "")
+    let b = &sys::cpuid().brand;
+    if b.is_empty() {
+        return "unknown CPU".into();
+    }
+    b.replace("AMD ", "")
         .replace(" 16-Core Processor", "")
         .replace(" 12-Core Processor", "")
         .replace(" 64-Core Processor", "")
+        .trim()
+        .to_string()
 }
 
 /// Content key of a template: the same work re-served keeps its epoch (the
@@ -1694,6 +1890,11 @@ enum Sink {
     Check(mpsc::Sender<(Found, Duration)>),
 }
 
+/// `block` event of --status-json.
+fn block_event(height: u64, result: &str, hash: Option<&str>) -> serde_json::Value {
+    json!({"type": "block", "ts": status::unix_now(), "height": height, "result": result, "hash": hash})
+}
+
 /// One submission, on its own thread: a single attempt, and the counters
 /// follow the answer — yes (accepted), no (refused), or none (unknown: a
 /// transport error or a timeout says nothing about the block).
@@ -1714,25 +1915,29 @@ fn submit_one(sub: &dyn Submit, tid: &str, f: Found, sh: &Shared) {
                 }
             }
             eprintln!(
-                "└─ SOLVED  nonce={}  digest={}…  hash={}…  latency={} us  answer={answer_ms} ms  [accepted {n}/{}]",
+                "└─ SOLVED  h={}  nonce={}  digest={}…  hash={}…  latency={} us  answer={answer_ms} ms  [accepted {n}/{}]",
+                f.height,
                 f.nonce,
                 hex::encode(&f.digest[24..]),
                 &hash[..hash.len().min(20)],
                 latency.as_micros(),
                 sh.found.load(Ordering::Relaxed)
             );
+            status::emit(block_event(f.height, "accepted", Some(&hash)));
         }
         Err(CallErr::Answer(e)) => {
             sh.refused.fetch_add(1, Ordering::Relaxed);
-            eprintln!("└─ submit {}: {e}  (nonce={} answer={answer_ms} ms)", classify_refusal(&e), f.nonce);
+            eprintln!("└─ submit {}: {e}  (h={} nonce={} answer={answer_ms} ms)", classify_refusal(&e), f.height, f.nonce);
+            status::emit(block_event(f.height, "refused", None));
         }
         Err(CallErr::Transport(e)) => {
             sh.unknown.fetch_add(1, Ordering::Relaxed);
             eprintln!(
                 "└─ submit: no answer, state unknown (the block may still be accepted; not retried): {e}  \
-                 (nonce={} after {answer_ms} ms)",
-                f.nonce
+                 (h={} nonce={} after {answer_ms} ms)",
+                f.height, f.nonce
             );
+            status::emit(block_event(f.height, "unknown", None));
         }
     }
 }
@@ -1774,11 +1979,13 @@ fn submit_loop(rx: mpsc::Receiver<Found>, sink: Sink, sh: Arc<Shared>) {
         }
         inflight.retain(|h| !h.is_finished());
         let (sh, slots) = (sh.clone(), slots.clone());
+        sh.inflight.fetch_add(1, Ordering::SeqCst);
         inflight.push(
             std::thread::Builder::new()
                 .name("submit".into())
                 .spawn(move || {
                     submit_one(&*sub, &tid, f, &sh);
+                    sh.inflight.fetch_sub(1, Ordering::SeqCst);
                     let (m, cv) = &*slots;
                     *m.lock().unwrap() -= 1;
                     cv.notify_one();
@@ -1799,8 +2006,116 @@ fn start_submitter(rx: mpsc::Receiver<Found>, sink: Sink, sh: &Arc<Shared>) -> s
         .expect("spawn submit dispatcher")
 }
 
+/// `profile` event of --status-json.
+fn profile_event(prof: &Profile, all_huge: bool) -> serde_json::Value {
+    json!({
+        "type": "profile",
+        "version": env!("CARGO_PKG_VERSION"),
+        "backend": jetsam_core::cpu::selected_backend().to_string(),
+        "cpu": cpu_model(),
+        "threads": prof.cpus.len(),
+        "tpc": prof.per_core,
+        "pads": prof.pads,
+        "prefetch": prof.prefetch,
+        "kernel": walk::describe(prof.kernel, prof.pads, prof.pipe),
+        "pages": sys::pages_label(all_huge),
+    })
+}
+
+/// `status` event of --status-json.
+fn status_event(hps: f64, height: Option<u64>, sh: &Shared, uptime_s: u64, state: &str, message: &str) -> serde_json::Value {
+    json!({
+        "type": "status",
+        "ts": status::unix_now(),
+        "hps": (hps * 10.0).round() / 10.0,
+        "height": height,
+        "found": sh.found.load(Ordering::Relaxed),
+        "accepted": sh.accepted.load(Ordering::Relaxed),
+        "refused": sh.refused.load(Ordering::Relaxed),
+        "unknown": sh.unknown.load(Ordering::Relaxed),
+        "uptime_s": uptime_s,
+        "state": state,
+        "message": message,
+    })
+}
+
+/// What the poller last saw, for the status thread.
+#[derive(Default)]
+struct NetView {
+    /// The last poll failed: no answer, 401, HTTP error.
+    error: Option<String>,
+    /// The last poll was answered with an RPC-level refusal (no work yet).
+    refusal: Option<String>,
+    /// The last template is the one this miner already won.
+    idle_after_win: bool,
+    /// Height of the last template.
+    height: Option<u64>,
+}
+
+/// --status-json: one `status` event every 5 s from its own thread, so a
+/// poll that waits on the node (up to 30 s) never delays it. The rate is
+/// measured over the last 10 s.
+fn start_status_thread(sh: Arc<Shared>, view: Arc<std::sync::Mutex<NetView>>, started: Instant) {
+    if !status::json_on() {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("status".into())
+        .spawn(move || {
+            let mut win: std::collections::VecDeque<(Instant, u64)> = Default::default();
+            win.push_back((Instant::now(), sh.hashed.load(Ordering::Relaxed)));
+            let mut next = Instant::now() + STATUS_EVERY;
+            loop {
+                std::thread::sleep(next.saturating_duration_since(Instant::now()));
+                next += STATUS_EVERY;
+                let now = Instant::now();
+                win.push_back((now, sh.hashed.load(Ordering::Relaxed)));
+                while win.len() > 3 {
+                    win.pop_front();
+                }
+                let (t0, h0) = win[0];
+                let dt = now.duration_since(t0).as_secs_f64();
+                let hps = if dt > 0.5 { (win.back().unwrap().1 - h0) as f64 / dt } else { 0.0 };
+                let live = sh.job.read().unwrap().is_some() && sh.now_ns() < sh.deadline_ns.load(Ordering::Relaxed);
+                let v = view.lock().unwrap();
+                let (state, message) = match (&v.error, live, &v.refusal) {
+                    (Some(e), _, _) => ("error", e.clone()),
+                    (None, true, _) => ("mining", String::new()),
+                    (None, false, Some(r)) => ("waiting", r.clone()),
+                    (None, false, None) if v.idle_after_win => ("waiting", "block accepted; waiting for the next one".into()),
+                    (None, false, None) => ("waiting", "waiting for a template".into()),
+                };
+                let e = status_event(hps, v.height, &sh, started.elapsed().as_secs(), state, &message);
+                drop(v);
+                status::emit(e);
+            }
+        })
+        .expect("spawn status thread");
+}
+
+/// Ctrl-C / SIGTERM: stop hashing, give the solutions already on the wire a
+/// few seconds for their answer, print the totals, exit 0.
+fn shutdown(sh: &Shared, started: Instant) -> ! {
+    sh.stop.store(true, Ordering::Relaxed);
+    let t = Instant::now();
+    while sh.inflight.load(Ordering::SeqCst) > 0 && t.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    exit_once(
+        0,
+        &format!(
+            "stopped after {} s: found={} accepted={} refused={} unknown={}",
+            started.elapsed().as_secs(),
+            sh.found.load(Ordering::Relaxed),
+            sh.accepted.load(Ordering::Relaxed),
+            sh.refused.load(Ordering::Relaxed),
+            sh.unknown.load(Ordering::Relaxed),
+        ),
+    )
+}
+
 fn mine(cli: &Cli, th: &Arc<Thermal>, prof: Arc<Profile>) -> Result<()> {
-    let host = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+    let started = Instant::now();
     let ident_cpu = format!(
         "{} - {}t ({}/core, {} pads{})",
         cpu_model(),
@@ -1812,7 +2127,7 @@ fn mine(cli: &Cli, th: &Arc<Thermal>, prof: Arc<Profile>) -> Result<()> {
     let mut rpc = Rpc {
         url: cli.rpc.clone(),
         key: cli.key.clone(),
-        host: header_safe(host.trim(), 32),
+        host: header_safe(&sys::hostname(), 32),
         cpu: header_safe(&ident_cpu, 64),
         http: reqwest::blocking::Client::builder().timeout(POLL_TIMEOUT).build()?,
         rate: Arc::new(AtomicU64::new(0)),
@@ -1826,6 +2141,7 @@ fn mine(cli: &Cli, th: &Arc<Thermal>, prof: Arc<Profile>) -> Result<()> {
         // Tell the pool's dashboard too: a 4K miner is a slow miner.
         rpc.cpu = format!("{} 4K!", header_safe(&rpc.cpu, 59));
     }
+    status::emit(profile_event(&prof, prof.huge && huge_ok == workers));
     // The submitter has its own client: a poll stuck in a timeout never
     // delays a found block.
     let submit_rpc = Rpc {
@@ -1839,6 +2155,7 @@ fn mine(cli: &Cli, th: &Arc<Thermal>, prof: Arc<Profile>) -> Result<()> {
         eff: rpc.eff,
     };
     let _submitter = start_submitter(rx, Sink::Net(Arc::new(submit_rpc)), &sh);
+    sys::install_stop_handler();
     eprintln!("rpc={}  auth={}  poll={}ms", cli.rpc, if cli.key.is_some() { "bearer" } else { "none" }, cli.poll_ms);
 
     let entropy = std::time::SystemTime::now()
@@ -1858,13 +2175,23 @@ fn mine(cli: &Cli, th: &Arc<Thermal>, prof: Arc<Profile>) -> Result<()> {
     let mut win: std::collections::VecDeque<(Instant, u64, u64)> = Default::default();
     let report_every = Duration::from_secs(cli.report_secs.unwrap_or(15).max(1));
     let mut region_seen: Option<u32> = None;
+    // --status-json: what the last poll said, read by the status thread.
+    let view = Arc::new(std::sync::Mutex::new(NetView::default()));
+    start_status_thread(sh.clone(), view.clone(), started);
 
     loop {
+        if sys::stop_requested() {
+            shutdown(&sh, started);
+        }
         // Template (solutions go out on the submit thread, never from here).
         match rpc.call_typed::<_, BlockTemplateResponse>("jetsam_getBlockTemplate", [cli.coinbase.as_str()]) {
             Ok(t) => {
                 backoff = Duration::from_millis(250);
                 last_refusal = None;
+                {
+                    let mut v = view.lock().unwrap();
+                    (v.error, v.refusal, v.height) = (None, None, Some(t.height));
+                }
                 let received = sh.now_ns();
                 if t.nonce_field_index != NONCE_FIELD {
                     return Err(anyhow!("template nonce_field_index must be {NONCE_FIELD}, got {}", t.nonce_field_index));
@@ -1877,7 +2204,9 @@ fn mine(cli: &Cli, th: &Arc<Thermal>, prof: Arc<Profile>) -> Result<()> {
                 }
                 let key = content_key(&t);
                 let deadline = template_deadline_ns(received, t.expires_in_seconds);
-                match poller.on_template(&key, sh.solved_epoch.load(Ordering::Relaxed)) {
+                let action = poller.on_template(&key, sh.solved_epoch.load(Ordering::Relaxed));
+                view.lock().unwrap().idle_after_win = action == TplAction::Idle;
+                match action {
                     TplAction::Idle => {} // already won this one; idle until the tip moves
                     TplAction::NewJob(epoch) => {
                         let fields = decode_fields(&t.pow_fields_hex)?;
@@ -1918,6 +2247,7 @@ fn mine(cli: &Cli, th: &Arc<Thermal>, prof: Arc<Profile>) -> Result<()> {
             // No answer: back off exponentially, up to 2 s.
             Err(CallErr::Transport(e)) => {
                 eprintln!("template fetch failed: {e} — retry in {:?}", backoff);
+                view.lock().unwrap().error = Some(e);
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(Duration::from_secs(2));
             }
@@ -1928,7 +2258,15 @@ fn mine(cli: &Cli, th: &Arc<Thermal>, prof: Arc<Profile>) -> Result<()> {
                 let repeat = matches!(&last_refusal, Some((m, t)) if *m == e && t.elapsed() < Duration::from_secs(10));
                 if !repeat {
                     eprintln!("template fetch refused: {e} — retry in {} ms", cli.poll_ms);
-                    last_refusal = Some((e, Instant::now()));
+                    last_refusal = Some((e.clone(), Instant::now()));
+                }
+                // An RPC-level refusal is a live node/pool without work for us
+                // yet; anything else (401, HTTP error, garbage) is an error.
+                let mut v = view.lock().unwrap();
+                if e.starts_with("RPC error") {
+                    (v.error, v.refusal) = (None, Some(e));
+                } else {
+                    (v.error, v.refusal) = (Some(e), None);
                 }
             }
         }
@@ -1949,12 +2287,13 @@ fn mine(cli: &Cli, th: &Arc<Thermal>, prof: Arc<Profile>) -> Result<()> {
             let job = sh.job.read().unwrap().clone();
             let (b0, b1) = (win[0].2, win.back().unwrap().2);
             let duty = if dt > 1.0 { (b1 - b0) as f64 / 1e9 / dt / prof.cpus.len() as f64 * 100.0 } else { 0.0 };
+            let temps = th.summary();
             eprintln!(
-                "⛏  {}  h={}  duty={duty:.1}%  pwm={:.2}  {}  found={} accepted={} refused={} unknown={}",
+                "⛏  {}  h={}  duty={duty:.1}%  {}{}found={} accepted={} refused={} unknown={}",
                 fmt_rate(rpc.rate.load(Ordering::Relaxed) as f64),
                 job.map(|j| j.height.to_string()).unwrap_or_else(|| "-".into()),
-                th.duty(),
-                th.summary(),
+                if th.guarded { format!("pwm={:.2}  ", th.duty()) } else { String::new() },
+                if temps.is_empty() { String::new() } else { format!("{temps}  ") },
                 sh.found.load(Ordering::Relaxed),
                 sh.accepted.load(Ordering::Relaxed),
                 sh.refused.load(Ordering::Relaxed),
@@ -1977,33 +2316,50 @@ fn check_hardware(cli: &Cli) -> bool {
         Ok(_) => line(true, "backend", format!("{}", jetsam_core::cpu::selected_backend())),
         Err(e) => line(false, "backend", format!("{e}")),
     }
-    let glibc = unsafe { std::ffi::CStr::from_ptr(libc::gnu_get_libc_version()) }.to_string_lossy().to_string();
-    line(true, "glibc", format!("runtime {glibc}"));
     match profile(cli) {
-        Ok(p) => line(
-            true,
-            "cpu",
-            format!("{} | L2 {} KiB, L3 {} KiB | profile {}", cpu_model(), p.l2_kib, p.l3_kib, p.source),
-        ),
+        Ok(p) => {
+            let id = sys::cpuid();
+            line(
+                true,
+                "cpu",
+                format!(
+                    "{} (family {}) | L2 {} KiB, L3 {} KiB | profile {} x {} pads (prefetch {}) on {} CPUs [{}]",
+                    cpu_model(),
+                    id.family,
+                    p.l2_kib,
+                    p.l3_kib,
+                    p.per_core,
+                    p.pads,
+                    p.prefetch as u8,
+                    p.cpus.len(),
+                    p.source
+                ),
+            );
+            line(
+                true,
+                "quota",
+                match &p.quota {
+                    Some(q) => format!("{:.2} CPUs ({}): at most {} worker threads", q.cpus, q.source, q.max_workers()),
+                    None => "none".into(),
+                },
+            );
+        }
         Err(e) => line(false, "cpu", format!("{e}")),
     }
-    let thp = sys::thp_mode();
-    line(thp != "never", "thp", thp.clone());
-    match sys::Region::new(1, true) {
-        Ok(r) => {
-            let kb = r.huge_kb();
-            let good = kb.map(|k| k >= r.expected_huge_kb()).unwrap_or(false);
-            line(good, "hugepage", format!("test region: AnonHugePages {} KiB of {}", opt(kb.map(|k| k as f64), 0), r.expected_huge_kb()));
-        }
-        Err(e) => line(false, "hugepage", format!("mmap: {e}")),
+    for (good, what, v) in sys::platform_checks() {
+        line(good, what, v);
     }
-    match thermal::Sensor::detect() {
+    #[cfg(feature = "fleet")]
+    match guard::Sensor::detect() {
         Some(s) => {
             let r = s.read().unwrap_or_default();
             line(true, "sensor", format!("{}  now {:.1} C", s.describe(), r.max_mc() as f64 / 1000.0));
         }
         None => line(false, "sensor", "none (k10temp / zenpower / coretemp): the miner refuses to start without --no-thermal-guard".into()),
     }
+    #[cfg(not(feature = "fleet"))]
+    line(true, "thermal", "none (public build: no thermal guard, no sensor needed)".into());
+    #[cfg(target_os = "linux")]
     match rapl::Rapl::open() {
         Some(r) => line(true, "rapl", format!("readable ({})", r.mode.name())),
         None => line(true, "rapl", "n/a (root or passwordless sudo needed; only --bench-walk/--tune use it)".into()),
@@ -2013,38 +2369,41 @@ fn check_hardware(cli: &Cli) -> bool {
 
 fn main() {
     let cli = Cli::parse();
+    if cli.status_json {
+        status::enable_json();
+    }
     if cli.check_hardware {
         std::process::exit(if check_hardware(&cli) { 0 } else { 1 });
     }
     if let Err(e) = validate(&cli) {
-        eprintln!("error: {e}");
-        std::process::exit(2);
+        exit_once(2, &format!("error: {e}"));
     }
     if let Err(e) = jetsam_core::cpu::ensure_production_hardware() {
-        eprintln!("fatal: {e}");
-        std::process::exit(1);
+        exit_once(1, &format!("fatal: {e}"));
     }
     if cli.gate {
-        // The gate runs every kernel shape at once on all cores: it gets the
-        // same guard as mining (stop at 81 C, predictive), without the
-        // regulator, and the same watchdog (gate threads at nice +10 check
-        // the reading's age before every walk). A tripped guard exits
-        // non-zero, so the gate fails safe.
+        // The gate runs every kernel shape at once on all cores. In the
+        // thermal-guard build it gets the same guard as mining (stop at 81 C,
+        // predictive), without the regulator, and the same watchdog (gate
+        // threads at nice +10 check the reading's age before every walk); a
+        // tripped guard exits non-zero, so the gate fails safe.
         let th = start_thermal(&cli);
         let ok = gate::full(cli.gate_random, &th);
+        #[cfg(feature = "fleet")]
         if th.guarded {
             println!(
                 "gate thermal guard: {} readings, longest gap {:.0} ms (poll {} ms, stale after {} ms), peak {:.1} C",
                 th.readings.load(Ordering::Relaxed),
                 th.gap_max_ns.load(Ordering::Relaxed) as f64 / 1e6,
-                cli.temp_poll_ms,
+                cli.guard.temp_poll_ms,
                 thermal::STALE_NS / 1_000_000,
                 th.peak_c()
             );
         }
         std::process::exit(if ok { 0 } else { 1 });
     }
-    if cli.temp_pause.is_some() || cli.temp_resume.is_some() {
+    #[cfg(feature = "fleet")]
+    if cli.guard.temp_pause.is_some() || cli.guard.temp_resume.is_some() {
         eprintln!(
             "warning: --temp-pause/--temp-resume are deprecated and ignored: replaced by --temp-target \
              (duty-cycle regulator) and --temp-stop"
@@ -2052,27 +2411,20 @@ fn main() {
     }
     let prof = match profile(&cli) {
         Ok(p) => Arc::new(p),
-        Err(e) => {
-            eprintln!("fatal: {e}");
-            std::process::exit(1);
-        }
+        Err(e) => exit_once(1, &format!("fatal: {e}")),
     };
     banner(&prof);
-    if prof.huge && sys::thp_mode() == "never" {
-        eprintln!(
-            "\x1b[31mTHP is disabled on this machine (transparent_hugepage/enabled = never): the pads would sit in \
-             4 KiB pages (~24 % slower). Enable THP (madvise) or pass --no-huge. Exit {EXIT_NO_HUGE}.\x1b[0m"
-        );
-        std::process::exit(EXIT_NO_HUGE);
+    if prof.huge {
+        if let Some(msg) = sys::huge_disabled() {
+            exit_once(EXIT_NO_HUGE, &red(&format!("{msg}. Exit {EXIT_NO_HUGE}.")));
+        }
     }
-    // The guard runs before anything hashes, the self-test included.
+    // The guard (thermal-guard build) runs before anything hashes, the
+    // self-test included.
     let th = start_thermal(&cli);
     match gate::self_test(prof.pads, prof.prefetch, prof.kernel, prof.huge, prof.pipe, 16, &th) {
         Ok(n) => eprintln!("self-test: {n}/{n} golden vectors bit-exact on this profile"),
-        Err(e) => {
-            eprintln!("SELF-TEST FAILED: {e}. Refusing to mine; exit {EXIT_SELFTEST}.");
-            std::process::exit(EXIT_SELFTEST);
-        }
+        Err(e) => exit_once(EXIT_SELFTEST, &format!("SELF-TEST FAILED: {e}. Refusing to mine; exit {EXIT_SELFTEST}.")),
     }
     if let Some(secs) = cli.check_nonces {
         std::process::exit(if check_nonces(&cli, &th, prof, secs.max(1)) { 0 } else { 1 });
@@ -2089,8 +2441,7 @@ fn main() {
         return;
     }
     if let Err(e) = mine(&cli, &th, prof) {
-        eprintln!("fatal: {e:#}");
-        std::process::exit(1);
+        exit_once(1, &format!("fatal: {e:#}"));
     }
 }
 
@@ -2102,23 +2453,34 @@ mod tests {
         Cli::try_parse_from(std::iter::once("towerminer").chain(args.iter().copied()))
     }
 
+    #[cfg(feature = "fleet")]
     #[test]
     fn cli_rejects_target_above_stop_minus_5() {
         let c = cli(&["--temp-stop", "70", "--temp-target", "66"]).unwrap();
         assert!(validate(&c).is_err(), "66 > 70 - 5 must be refused");
         let c = cli(&["--temp-stop", "70", "--temp-target", "65"]).unwrap();
         assert!(validate(&c).is_ok());
-        // The stop can never be raised above the house rule.
+        // The stop can never be raised above the hard limit.
         assert!(cli(&["--temp-stop", "83"]).is_err());
         assert!(cli(&["--temp-stop", "82"]).is_ok());
         // Without an explicit target the default follows a lowered stop.
         let c = cli(&["--temp-stop", "60"]).unwrap();
         assert!(validate(&c).is_ok());
-        assert_eq!(c.temp_target(), 55.0);
-        assert_eq!(cli(&[]).unwrap().temp_target(), 74.0);
+        assert_eq!(c.guard.temp_target(), 55.0);
+        assert_eq!(cli(&[]).unwrap().guard.temp_target(), 74.0);
         // Sensor cadence is bounded.
         assert!(cli(&["--temp-poll-ms", "600"]).is_err());
         assert!(cli(&["--temp-poll-ms", "99"]).is_err());
+    }
+
+    #[cfg(not(feature = "fleet"))]
+    #[test]
+    fn public_build_has_no_thermal_options() {
+        assert!(cli(&["--temp-stop", "70"]).is_err());
+        assert!(cli(&["--no-thermal-guard"]).is_err());
+        let c = cli(&[]).unwrap();
+        assert_eq!(reg_target(&c), None);
+        assert!(!start_thermal(&c).guarded);
     }
 
     // ---------------------------------------------------------------------
@@ -2142,6 +2504,8 @@ mod tests {
             policy: Policy::Hashrate,
             source: "test".into(),
             tune_key: String::new(),
+            quota: None,
+            uncapped: 1,
         }
     }
 
@@ -2324,6 +2688,7 @@ mod tests {
         let walked = jetsam_poseidon2b::towerwalk::towerwalk_digest(&seed);
         assert_eq!(walked, f.digest, "the reported digest is the reference walk of that nonce");
         assert_ne!(walked, seed, "the walk must not be the identity");
+        assert_eq!(f.height, 7, "a solution carries the height of its job");
     }
 
     // ---------------------------------------------------------------------
@@ -2387,7 +2752,6 @@ mod tests {
             }
         }
     }
-
 
     fn tpl(id: &str, fields: &str, height: u64, prefix: Option<u32>) -> BlockTemplateResponse {
         BlockTemplateResponse {
@@ -2472,7 +2836,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let (vtx, vrx) = mpsc::channel();
         let h = start_submitter(rx, Sink::Check(vtx), &sh);
-        let f = |epoch, nonce| Found { epoch, template_id: "x".into(), nonce, digest: [0; 32], t_found: Instant::now() };
+        let f = |epoch, nonce| Found { epoch, template_id: "x".into(), height: 7, nonce, digest: [0; 32], t_found: Instant::now() };
         tx.send(f(1, 10)).unwrap(); // replaced epoch: dropped
         tx.send(f(2, 11)).unwrap(); // live: forwarded
         drop(tx);
@@ -2512,7 +2876,7 @@ mod tests {
     }
 
     fn found(nonce: u128) -> Found {
-        Found { epoch: 1, template_id: "tpl1".into(), nonce, digest: [0; 32], t_found: Instant::now() }
+        Found { epoch: 1, template_id: "tpl1".into(), height: 7, nonce, digest: [0; 32], t_found: Instant::now() }
     }
 
     /// Run the dispatcher on `founds` against `sink`, wait for every answer.
@@ -2550,6 +2914,7 @@ mod tests {
         h.join().unwrap();
         assert_eq!(sh.accepted.load(Ordering::Relaxed), 2, "both answered yes");
         assert_eq!((sh.refused.load(Ordering::Relaxed), sh.unknown.load(Ordering::Relaxed)), (0, 0));
+        assert_eq!(sh.inflight.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -2580,17 +2945,72 @@ mod tests {
     }
 
     #[test]
-    fn table_rows_measured_2026_09_30() {
+    fn amd_table_rows_unchanged() {
         const F: u8 = walk::K_FAST;
-        let s = |fam, l2, p| table(fam, l2, p).0;
-        for p in [Policy::Hashrate, Policy::Efficiency] {
-            assert_eq!(s(23, 512, p), Shape::new(2, 1, true, F), "Zen 2");
-            assert_eq!(s(25, 1024, p), Shape::new(2, 1, false, F), "Zen 4");
-            assert_eq!(s(26, 1024, p), Shape::new(2, 1, false, F), "Zen 5 follows Zen 4");
+        for solo in [false, true] {
+            let s = |fam, l2, p| table(false, fam, l2, solo, p).0;
+            for p in [Policy::Hashrate, Policy::Efficiency] {
+                assert_eq!(s(23, 512, p), Shape::new(2, 1, true, F), "Zen 2");
+                assert_eq!(s(25, 1024, p), Shape::new(2, 1, false, F), "Zen 4");
+                assert_eq!(s(26, 1024, p), Shape::new(2, 1, false, F), "Zen 5 follows Zen 4");
+            }
+            // Zen 3 (L2 512 KiB) unchanged.
+            assert_eq!(s(25, 512, Policy::Hashrate), Shape::new(1, 1, false, F));
+            assert_eq!(s(25, 512, Policy::Efficiency), Shape::new(2, 2, true, F));
+            // Unknown vendors / families keep the node shape.
+            assert_eq!(s(24, 512, Policy::Hashrate), Shape::new(2, 1, false, F));
         }
-        // Zen 3 (L2 512 KiB) unchanged.
-        assert_eq!(s(25, 512, Policy::Hashrate), Shape::new(1, 1, false, F));
-        assert_eq!(s(25, 512, Policy::Efficiency), Shape::new(2, 2, true, F));
+    }
+
+    #[test]
+    fn intel_table_rows_measured_2026_09_30() {
+        const F: u8 = walk::K_FAST;
+        for p in [Policy::Hashrate, Policy::Efficiency] {
+            let s = |l2, solo| table(true, 6, l2, solo, p).0;
+            // One thread per core (no SMT, or a quota <= cores): 2 pads + prefetch.
+            for l2 in [256, 512, 1280, 2048, 3072] {
+                assert_eq!(s(l2, true), Shape::new(1, 2, true, F), "solo, L2 {l2}");
+            }
+            // SMT below 2 MiB of L2: the node shape (8700K, 11700F).
+            for l2 in [256, 512, 1024, 1280] {
+                assert_eq!(s(l2, false), Shape::new(2, 1, false, F), "SMT, L2 {l2}");
+            }
+            // SMT with 2 MiB of L2 or more: four pads per core.
+            assert_eq!(s(2048, false), Shape::new(2, 2, true, F));
+        }
+        // Intel family 6 is only matched for Intel.
+        assert_eq!(table(false, 6, 2048, true, Policy::Hashrate).0, Shape::new(2, 1, false, F));
+    }
+
+    /// The panel's machines, as they will run: every row picks the shape that
+    /// the machine's own --tune measured best.
+    #[test]
+    fn intel_rows_pick_each_panel_machine_s_measured_best() {
+        // (label, L2 KiB, SMT visible, cores, quota workers, measured best)
+        let panel: [(&str, usize, bool, usize, Option<usize>, (usize, usize, bool)); 11] = [
+            ("i7-8700K", 256, true, 6, Some(12), (2, 1, false)),
+            ("i7-11700F", 512, true, 3, Some(6), (2, 1, false)),
+            ("Ultra 9 285K", 3072, false, 24, None, (1, 2, true)),
+            ("Gold 6430 VM", 2048, false, 128, None, (1, 2, true)),
+            ("i7-12700", 1280, true, 8, Some(4), (1, 2, true)),
+            ("Gold 6330", 1280, true, 56, Some(14), (1, 2, true)),
+            ("E5-2670", 256, true, 16, Some(16), (1, 2, true)),
+            ("E5-2620 v3", 256, true, 6, Some(6), (1, 2, true)),
+            ("Gold 5115", 1024, true, 20, Some(5), (1, 2, true)),
+            ("i7-13700", 2048, true, 8, Some(4), (1, 2, true)),
+            ("Gold 6244", 1024, true, 16, Some(16), (1, 2, false)),
+        ];
+        for (label, l2, smt, cores, cap, best) in panel {
+            let solo = !smt || cap.is_some_and(|c| c <= cores);
+            let sh = table(true, 6, l2, solo, Policy::Hashrate).0;
+            // The Gold 6244 run measured only 1x1x0 and 1x2x0 before it stopped:
+            // pads and threads per core are what is checked there.
+            if label == "Gold 6244" {
+                assert_eq!((sh.tpc, sh.pads), (best.0, best.1), "{label}");
+            } else {
+                assert_eq!((sh.tpc, sh.pads, sh.pf), best, "{label}");
+            }
+        }
     }
 
     #[test]
@@ -2605,5 +3025,59 @@ mod tests {
         assert!(!prof(&["--pads", "2", "--prefetch", "1"]).unwrap().pipe);
         assert!(prof(&["--pads", "2", "--pipe", "1"]).is_err());
         assert!(prof(&["--pads", "1", "--kernel", "base", "--pipe", "1"]).is_err());
+    }
+
+    #[test]
+    fn threads_is_a_number_of_logical_cpus_and_the_profile_applies_inside() {
+        let prof = |a: &[&str]| profile(&cli(&[&["--no-tune-file"], a].concat()).unwrap()).unwrap();
+        let all = sys::allowed_cpus();
+        for n in 1..=all.len().min(4) {
+            let ns = n.to_string();
+            let p = prof(&["--threads", &ns, "--threads-per-core", "2"]);
+            assert!(p.cpus.len() <= n, "--threads {n}: {} workers", p.cpus.len());
+            assert!(p.cpus.iter().all(|c| all.contains(c)));
+            // One thread per core never runs more workers than 2 per core would.
+            let q = prof(&["--threads", &ns, "--threads-per-core", "1"]);
+            assert!(q.cpus.len() <= p.cpus.len());
+        }
+        // A quota caps the workers whatever the profile.
+        let p = prof(&["--threads-per-core", "2"]);
+        if let Some(q) = &p.quota {
+            assert!(p.cpus.len() <= q.max_workers());
+        }
+        assert!(validate(&cli(&["--threads", "0"]).unwrap()).is_err());
+    }
+
+    #[test]
+    fn status_json_events_follow_the_contract() {
+        let sh = shared(None, 0);
+        sh.found.store(3, Ordering::Relaxed);
+        sh.accepted.store(2, Ordering::Relaxed);
+        sh.unknown.store(1, Ordering::Relaxed);
+        let v = status_event(1234.56, Some(42), &sh, 17, "mining", "");
+        let keys: BTreeSet<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["type", "ts", "hps", "height", "found", "accepted", "refused", "unknown", "uptime_s", "state", "message"]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(v["type"], "status");
+        assert_eq!(v["hps"].as_f64(), Some(1234.6));
+        assert_eq!((v["height"].as_u64(), v["found"].as_u64(), v["accepted"].as_u64()), (Some(42), Some(3), Some(2)));
+        assert!(status_event(0.0, None, &sh, 0, "waiting", "x")["height"].is_null());
+        let b = block_event(9, "accepted", Some("ab12"));
+        assert_eq!((b["type"].as_str(), b["height"].as_u64(), b["result"].as_str(), b["hash"].as_str()), (Some("block"), Some(9), Some("accepted"), Some("ab12")));
+        assert!(block_event(9, "unknown", None)["hash"].is_null());
+        let p = profile_event(&test_profile(2, walk::K_FAST, false, 2), true);
+        let keys: BTreeSet<&str> = p.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["type", "version", "backend", "cpu", "threads", "tpc", "pads", "prefetch", "kernel", "pages"].into_iter().collect()
+        );
+        assert_eq!(p["version"], env!("CARGO_PKG_VERSION"));
+        assert!(["2M", "large"].contains(&p["pages"].as_str().unwrap()));
+        // Every event is a single line.
+        assert!(!v.to_string().contains('\n') && !p.to_string().contains('\n'));
     }
 }

@@ -73,14 +73,12 @@ fn guard_ok(th: &Thermal) {
     while !thermal::worker_may_hash(th) {}
 }
 
-/// Gate threads run at nice +10, so the thermal guard thread (nice 0) wins
-/// the CPU whenever it wakes, however many shapes run at once. Lowering one's
-/// own priority needs no privilege; a failure only costs that margin.
+/// Gate threads run at a lower priority (nice +10 on Linux), so the thermal
+/// guard thread of the thermal-guard build wins the CPU whenever it wakes,
+/// however many shapes run at once, and the machine stays usable. Lowering
+/// one's own priority needs no privilege; a failure only costs that margin.
 fn lower_priority() {
-    unsafe {
-        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
-        libc::setpriority(libc::PRIO_PROCESS, tid, 10);
-    }
+    crate::sys::lower_thread_priority();
 }
 
 /// Run `seeds` through the kernel at (p, pf, k) — every seed visits every

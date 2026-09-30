@@ -16,3 +16,6 @@ codegen-units = 1
 # A worker that panics must take the process down with it: a miner that goes
 # on with N-1 threads reports a rate it no longer has.
 panic = "abort"
+# Release binaries carry no symbol table (and no build paths: see
+# scripts/build.sh, --remap-path-prefix).
+strip = true
