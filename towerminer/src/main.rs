@@ -108,6 +108,11 @@ struct Cli {
     /// CPUs this miner may use (e.g. 0-11,24-35). Default: the process affinity.
     #[arg(long, value_name = "LIST")]
     cpus: Option<String>,
+    /// Name sent to the node or pool in the X-Jetsam-Host header, for
+    /// per-machine statistics (printable ASCII, 32 characters at most).
+    /// Default: no name is sent; the hostname is never transmitted.
+    #[arg(long, value_name = "NAME")]
+    worker_name: Option<String>,
     /// CPUs to leave alone (removed from --cpus / the affinity).
     #[arg(long, value_name = "LIST")]
     exclude_cpus: Option<String>,
@@ -980,9 +985,9 @@ struct Resp<T> {
 struct Rpc {
     url: String,
     key: Option<String>,
-    /// Self-description sent to the pool, so its dashboard can name this
-    /// machine.
-    host: String,
+    /// X-Jetsam-Host: the name the pool's dashboard shows for this machine;
+    /// None = no such header.
+    host: Option<String>,
     cpu: String,
     http: reqwest::blocking::Client,
     rate: Arc<AtomicU64>,
@@ -1046,10 +1051,12 @@ impl Rpc {
         if r > 0 {
             req = req.header("X-Jetsam-Hashrate", r.to_string());
         }
+        if let Some(h) = &self.host {
+            req = req.header("X-Jetsam-Host", h);
+        }
         req = req
             .header("X-Jetsam-Version", VERSION)
             .header("X-Jetsam-PoW", "walk")
-            .header("X-Jetsam-Host", &self.host)
             .header("X-Jetsam-CPU", self.cpu_header());
         let resp = req.send().map_err(|e| CallErr::Transport(format!("POST {}: {}", self.url, err_chain(&e))))?;
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -1792,6 +1799,13 @@ fn header_safe(s: &str, max: usize) -> String {
     s.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(max).collect::<String>().trim().to_string()
 }
 
+/// X-Jetsam-Host value: `--worker-name` cleaned, else `fallback` (the
+/// hostname in the thermal-guard build, None in the public build). Empty
+/// after cleaning = no header.
+fn worker_header(name: Option<&str>, fallback: Option<&str>) -> Option<String> {
+    Some(header_safe(name.or(fallback)?, 32)).filter(|h| !h.is_empty())
+}
+
 fn cpu_model() -> String {
     let b = &sys::cpuid().brand;
     if b.is_empty() {
@@ -2127,7 +2141,9 @@ fn mine(cli: &Cli, th: &Arc<Thermal>, prof: Arc<Profile>) -> Result<()> {
     let mut rpc = Rpc {
         url: cli.rpc.clone(),
         key: cli.key.clone(),
-        host: header_safe(&sys::hostname(), 32),
+        // The fleet's pool names its machines by hostname; the public build
+        // sends a name only when the user gives one.
+        host: worker_header(cli.worker_name.as_deref(), cfg!(feature = "fleet").then(sys::hostname).as_deref()),
         cpu: header_safe(&ident_cpu, 64),
         http: reqwest::blocking::Client::builder().timeout(POLL_TIMEOUT).build()?,
         rate: Arc::new(AtomicU64::new(0)),
@@ -3079,5 +3095,94 @@ mod tests {
         assert!(["2M", "large"].contains(&p["pages"].as_str().unwrap()));
         // Every event is a single line.
         assert!(!v.to_string().contains('\n') && !p.to_string().contains('\n'));
+    }
+
+    // ---------------------------------------------------------------------
+    // X-Jetsam-Host: only a name the user chose, never the hostname by
+    // default.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn worker_header_public_default_sends_nothing() {
+        assert_eq!(worker_header(None, None), None);
+        assert_eq!(cli(&[]).unwrap().worker_name, None);
+    }
+
+    #[test]
+    fn worker_header_uses_the_worker_name() {
+        assert_eq!(worker_header(Some("rig-1"), None).as_deref(), Some("rig-1"));
+        let c = cli(&["--worker-name", "rig-1"]).unwrap();
+        assert_eq!(c.worker_name.as_deref(), Some("rig-1"));
+        // An explicit name wins over the fleet default.
+        assert_eq!(worker_header(Some("rig-1"), Some("host-a")).as_deref(), Some("rig-1"));
+    }
+
+    #[test]
+    fn worker_header_empty_sends_nothing() {
+        assert_eq!(worker_header(Some(""), None), None);
+        assert_eq!(worker_header(Some("   "), None), None);
+        // Empty once cleaned: nothing printable is left.
+        assert_eq!(worker_header(Some("\u{e9}\u{e8}\r\n\t"), None), None);
+        // An explicit empty name also silences the fleet default.
+        assert_eq!(worker_header(Some(""), Some("host-a")), None);
+    }
+
+    #[test]
+    fn worker_header_is_cleaned_by_header_safe() {
+        let long = "a".repeat(40);
+        assert_eq!(worker_header(Some(&long), None), Some("a".repeat(32)));
+        // No header injection: CR/LF and non-ASCII are dropped.
+        assert_eq!(worker_header(Some("rig-1\r\nX-Evil: 1"), None).as_deref(), Some("rig-1X-Evil: 1"));
+        assert_eq!(worker_header(Some("  caf\u{e9} 2 "), None).as_deref(), Some("caf 2"));
+    }
+
+    #[test]
+    fn worker_header_fleet_default_is_the_fallback() {
+        assert_eq!(worker_header(None, Some("host-a")).as_deref(), Some("host-a"));
+        assert_eq!(worker_header(None, Some("")), None);
+    }
+
+    /// One JSON-RPC call against a local listener; returns the request's
+    /// header lines, lower-cased.
+    fn headers_sent(host: Option<String>) -> Vec<String> {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", l.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = s.read(&mut chunk).unwrap();
+                assert!(n > 0, "connection closed before the headers");
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":7}"#;
+            write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            let head = String::from_utf8_lossy(&buf).to_string();
+            head.split("\r\n\r\n").next().unwrap().lines().skip(1).map(|h| h.to_ascii_lowercase()).collect::<Vec<_>>()
+        });
+        let rpc = Rpc {
+            url,
+            key: None,
+            host,
+            cpu: "test cpu".into(),
+            http: reqwest::blocking::Client::builder().timeout(Duration::from_secs(10)).build().unwrap(),
+            rate: Arc::new(AtomicU64::new(0)),
+            th: None,
+            eff: false,
+        };
+        let r: u64 = rpc.call_typed("ping", serde_json::json!([])).unwrap();
+        assert_eq!(r, 7);
+        server.join().unwrap()
+    }
+
+    #[test]
+    fn rpc_sends_host_header_only_when_set() {
+        let none = headers_sent(None);
+        assert!(!none.iter().any(|h| h.starts_with("x-jetsam-host:")), "{none:?}");
+        assert!(none.iter().any(|h| h.starts_with("x-jetsam-cpu:")), "{none:?}");
+        let some = headers_sent(Some("rig-1".into()));
+        assert!(some.iter().any(|h| h == "x-jetsam-host: rig-1"), "{some:?}");
     }
 }
