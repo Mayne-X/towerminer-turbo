@@ -101,7 +101,7 @@ pub fn is_lan(ip: IpAddr) -> bool {
 /// network unless `allow_public`.
 pub fn check_listen(s: &str, allow_public: bool) -> Result<SocketAddr, String> {
     let a: SocketAddr = s.trim().parse().map_err(|_| {
-        format!("--serve {s}: expected IP:PORT, the address of this machine on your local network, for example 192.168.1.10:9702")
+        format!("--serve {s}: expected IP:PORT, the address of this machine on your local network, for example 192.168.0.10:9702")
     })?;
     if allow_public {
         return Ok(a);
@@ -109,7 +109,7 @@ pub fn check_listen(s: &str, allow_public: bool) -> Result<SocketAddr, String> {
     if a.ip().is_unspecified() {
         return Err(format!(
             "--serve {a}: {} listens on every interface, public ones included. Give this machine's address on your \
-             local network instead, for example 192.168.1.10:{}",
+             local network instead, for example 192.168.0.10:{}",
             a.ip(),
             a.port()
         ));
@@ -1170,13 +1170,13 @@ mod tests {
             "10.255.255.254",
             "172.16.0.1",
             "172.31.255.1",
-            "192.168.1.10",
+            "192.168.0.10",
             "169.254.3.4",
             "127.0.0.1",
             "127.5.6.7",
             "::1",
             "fe80::1",
-            "::ffff:192.168.1.20",
+            "::ffff:192.168.0.20",
         ] {
             assert!(is_lan(ip(a)), "{a} is local");
         }
@@ -1201,7 +1201,7 @@ mod tests {
 
     #[test]
     fn listen_refuses_public_and_unspecified_addresses() {
-        assert_eq!(check_listen("192.168.1.10:9702", false).unwrap(), "192.168.1.10:9702".parse().unwrap());
+        assert_eq!(check_listen("192.168.0.10:9702", false).unwrap(), "192.168.0.10:9702".parse().unwrap());
         assert!(check_listen("127.0.0.1:9702", false).is_ok());
         let e = check_listen("8.8.8.8:9702", false).unwrap_err();
         assert!(e.contains("not a local-network address"), "{e}");
@@ -1209,7 +1209,7 @@ mod tests {
         assert!(e.contains("every interface"), "{e}");
         assert!(check_listen("[::]:9702", false).is_err());
         assert!(check_listen("my-host:9702", false).is_err(), "a host name is not an address");
-        assert!(check_listen("192.168.1.10", false).is_err(), "the port is required");
+        assert!(check_listen("192.168.0.10", false).is_err(), "the port is required");
         // The explicit override, and only it, lets a public address through.
         assert!(check_listen("8.8.8.8:9702", true).is_ok());
         assert!(check_listen("0.0.0.0:9702", true).is_ok());
@@ -1245,14 +1245,14 @@ mod tests {
     #[test]
     fn every_miner_gets_its_own_nonce_region() {
         let mut w = Workers::new(7);
-        let a = w.touch(ip("192.168.1.20"), &seen(None), 100);
-        let b = w.touch(ip("192.168.1.21"), &seen(None), 100);
-        let c = w.touch(ip("192.168.1.20"), &seen(Some("rig-2")), 100);
+        let a = w.touch(ip("192.168.0.20"), &seen(None), 100);
+        let b = w.touch(ip("192.168.0.21"), &seen(None), 100);
+        let c = w.touch(ip("192.168.0.20"), &seen(Some("rig-2")), 100);
         let regions: Vec<u32> = [&a, &b, &c].iter().map(|id| w.get(id).unwrap().region).collect();
         assert_eq!(regions.len(), 3);
         assert!(regions[0] != regions[1] && regions[1] != regions[2] && regions[0] != regions[2], "{regions:?}");
         // The same miner keeps its region: its work carries on across polls.
-        let a2 = w.touch(ip("192.168.1.20"), &seen(None), 105);
+        let a2 = w.touch(ip("192.168.0.20"), &seen(None), 105);
         assert_eq!(a2, a);
         assert_eq!(w.get(&a).unwrap().region, regions[0]);
         assert_eq!(w.get(&a).unwrap().jobs, 2);
@@ -1284,8 +1284,8 @@ mod tests {
     #[test]
     fn found_accepted_refused_are_counted_per_worker() {
         let mut w = Workers::new(0);
-        let a = w.touch(ip("192.168.1.20"), &seen(Some("a")), 1);
-        let b = w.touch(ip("192.168.1.21"), &seen(Some("b")), 1);
+        let a = w.touch(ip("192.168.0.20"), &seen(Some("a")), 1);
+        let b = w.touch(ip("192.168.0.21"), &seen(Some("b")), 1);
         w.found(&a);
         w.outcome(&a, Outcome::Accepted);
         w.found(&a);

@@ -161,7 +161,7 @@ Windows (cmd):
 ### Recipe 2 — the node for your network: node + relay
 
 Find the machine's address on your network (`hostname -I` on Linux, the
-"IPv4 Address" line of `ipconfig` on Windows); below, `192.168.1.10`. Choose
+"IPv4 Address" line of `ipconfig` on Windows); below, `192.168.0.10`. Choose
 a LAN key, for example with `openssl rand -hex 16` (Linux) or
 `powershell -Command "[guid]::NewGuid().ToString('N')"` (Windows).
 
@@ -169,21 +169,21 @@ Linux:
 
     jetsam --mode extminer --mining-key '<node key>'
     TOWERMINER_KEY='<node key>' TOWERMINER_LAN_KEY='<LAN key>' \
-        towerminer --serve 192.168.1.10:9702 --rpc http://127.0.0.1:9701
+        towerminer --serve 192.168.0.10:9702 --rpc http://127.0.0.1:9701
 
 Windows (cmd):
 
     jetsam.exe --mode extminer --mining-key <node key>
     set TOWERMINER_KEY=<node key>
     set TOWERMINER_LAN_KEY=<LAN key>
-    towerminer.exe --serve 192.168.1.10:9702 --rpc http://127.0.0.1:9701
+    towerminer.exe --serve 192.168.0.10:9702 --rpc http://127.0.0.1:9701
 
 (`--key` and `--lan-key` work too; the environment keeps the keys out of
 the process list.) The relay itself hashes nothing and runs at normal
 priority. To mine on this machine as well, start a miner through the relay,
 like any other machine (recipe 3), in another terminal:
 
-    TOWERMINER_KEY='<LAN key>' towerminer --rpc http://192.168.1.10:9702 --worker-name node-pc
+    TOWERMINER_KEY='<LAN key>' towerminer --rpc http://192.168.0.10:9702 --worker-name node-pc
 
 It runs at low priority, as always, so the node's logbook proof keeps the CPU
 first.
@@ -192,12 +192,12 @@ first.
 
 Linux:
 
-    TOWERMINER_KEY='<LAN key>' towerminer --rpc http://192.168.1.10:9702 --worker-name attic
+    TOWERMINER_KEY='<LAN key>' towerminer --rpc http://192.168.0.10:9702 --worker-name attic
 
 Windows (cmd):
 
     set TOWERMINER_KEY=<LAN key>
-    towerminer.exe --rpc http://192.168.1.10:9702 --worker-name attic
+    towerminer.exe --rpc http://192.168.0.10:9702 --worker-name attic
 
 `--worker-name` is optional; it names the machine in the relay's list (else
 its address). On a machine that runs nothing else, `--priority normal` is
@@ -218,11 +218,11 @@ Every 30 s (`--report-secs`) its log sums up the state, the height, the
 workers, their total rate and the blocks, then one line per machine: name,
 address, CPU, rate, when it was last seen, blocks found / accepted /
 refused. Each solution is logged with its verdict (`BLOCK ACCEPTED h=...
-from attic (192.168.1.21)`). With `--status-json`, stdout carries:
+from attic (192.168.0.21)`). With `--status-json`, stdout carries:
 
-    {"type":"relay","ts":1790763206,"version":"0.3.1","listen":"192.168.1.10:9702","upstream":"http://127.0.0.1:9701","state":"serving","message":"","height":25310,"workers":2,"hps":31000,"found":3,"accepted":2,"refused":1,"unknown":0,"uptime_s":3605}
-    {"type":"workers","ts":1790763206,"workers":[{"id":"192.168.1.21/attic","name":"attic","ip":"192.168.1.21","cpu":"Ryzen 9 5950X - 32t (2/core, 1 pads)","version":"towerminer/0.3.1","hps":16890,"last_seen":1790763205,"jobs":1234,"found":2,"accepted":2,"refused":0,"unknown":0,"region":2861541377}]}
-    {"type":"block","ts":1790763300,"height":25311,"result":"accepted","hash":"<block hash, hex>","worker":"attic (192.168.1.21)","ip":"192.168.1.21","message":""}
+    {"type":"relay","ts":1790763206,"version":"0.3.1","listen":"192.168.0.10:9702","upstream":"http://127.0.0.1:9701","state":"serving","message":"","height":25310,"workers":2,"hps":31000,"found":3,"accepted":2,"refused":1,"unknown":0,"uptime_s":3605}
+    {"type":"workers","ts":1790763206,"workers":[{"id":"192.168.0.21/attic","name":"attic","ip":"192.168.0.21","cpu":"Ryzen 9 5950X - 32t (2/core, 1 pads)","version":"towerminer/0.3.1","hps":16890,"last_seen":1790763205,"jobs":1234,"found":2,"accepted":2,"refused":0,"unknown":0,"region":2861541377}]}
+    {"type":"block","ts":1790763300,"height":25311,"result":"accepted","hash":"<block hash, hex>","worker":"attic (192.168.0.21)","ip":"192.168.0.21","message":""}
 
 - `relay` every 5 s: `state` is `serving` (a live template), `waiting`
   (no template yet, the node is synchronizing, or a block was just found) or

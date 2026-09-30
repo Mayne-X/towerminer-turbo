@@ -226,7 +226,7 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Priority::Low)]
     priority: Priority,
     /// Run the LAN relay instead of mining, on this machine's address on your
-    /// local network (e.g. 192.168.1.10:9702): the node on this machine does
+    /// local network (e.g. 192.168.0.10:9702): the node on this machine does
     /// the logbook proof, the other machines of the network mine through the
     /// relay with --rpc http://IP:PORT --key <LAN key>. --rpc/--key are then
     /// the node's own endpoint and mining key. Only private, link-local and
