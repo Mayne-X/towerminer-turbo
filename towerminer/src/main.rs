@@ -26,6 +26,7 @@ mod rapl;
 #[cfg(not(target_os = "linux"))]
 #[path = "rapl_none.rs"]
 mod rapl;
+mod relay;
 mod status;
 mod sys;
 mod thermal;
@@ -61,8 +62,12 @@ const SUBMIT_MARGIN: Duration = Duration::from_secs(1);
 /// the node up to 30 s, since it finishes its proof before it seals the
 /// block. A 5 s timeout with one retry printed "no answer" then "refused" for
 /// blocks the pool reported accepted [2026-09-30]. One attempt only: the pool
-/// retries on its side, and a duplicate submission is harmful.
-const SUBMIT_TIMEOUT: Duration = Duration::from_secs(45);
+/// retries on its side, and a duplicate submission is harmful. Through a LAN
+/// relay a solution found while the node still proves its template waits for
+/// the end of that proof: 49 s measured on the testnet, answered after a
+/// 45 s timeout had already counted it "unknown" [2026-09-30]. Each
+/// submission has its own thread, so a long wait never holds back mining.
+const SUBMIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Submissions in flight at once, each on its own thread: a second block found
 /// while the first one waits for its answer goes out at once.
 const SUBMIT_MAX_INFLIGHT: usize = 4;
@@ -220,6 +225,23 @@ struct Cli {
     /// priority as it is (a machine that only mines).
     #[arg(long, value_enum, default_value_t = Priority::Low)]
     priority: Priority,
+    /// Run the LAN relay instead of mining, on this machine's address on your
+    /// local network (e.g. 192.168.1.10:9702): the node on this machine does
+    /// the logbook proof, the other machines of the network mine through the
+    /// relay with --rpc http://IP:PORT --key <LAN key>. --rpc/--key are then
+    /// the node's own endpoint and mining key. Only private, link-local and
+    /// loopback addresses, for the relay and for its clients.
+    #[arg(long, value_name = "IP:PORT", conflicts_with_all = ["gate", "tune", "bench_walk", "check_nonces", "check_hardware", "coinbase"])]
+    serve: Option<String>,
+    /// --serve: the key your mining machines present (their --key); at least
+    /// 16 characters, never the node's mining key.
+    #[arg(long, value_name = "KEY", env = "TOWERMINER_LAN_KEY", hide_env_values = true)]
+    lan_key: Option<String>,
+    /// --serve, RISKY: also listen on a public address and serve clients
+    /// outside your local network. The relay speaks plain HTTP: the LAN key
+    /// travels in clear and anyone who reads it can mine on your node.
+    #[arg(long, requires = "serve")]
+    allow_public: bool,
 }
 
 /// Thermal-guard options (thermal-guard build only).
@@ -2362,6 +2384,24 @@ fn mine(cli: &Cli, th: &Arc<Thermal>, prof: Arc<Profile>) -> Result<()> {
     }
 }
 
+/// --serve: the LAN relay. It hashes nothing, so it keeps the normal
+/// priority (it answers the miners faster) and needs no CPU check.
+fn serve(cli: &Cli, addr: &str) -> ! {
+    let listen = relay::check_listen(addr, cli.allow_public).unwrap_or_else(|e| exit_once(2, &format!("error: {e}")));
+    let lan_key =
+        relay::check_lan_key(cli.lan_key.as_deref(), cli.key.as_deref()).unwrap_or_else(|e| exit_once(2, &format!("error: {e}")));
+    eprintln!("{VERSION}  LAN relay");
+    relay::run(relay::Config {
+        listen,
+        upstream: cli.rpc.clone(),
+        node_key: cli.key.clone().filter(|k| !k.trim().is_empty()),
+        lan_key,
+        allow_public: cli.allow_public,
+        report_every: Duration::from_secs(cli.report_secs.unwrap_or(30).max(1)),
+        version: VERSION,
+    })
+}
+
 /// --check-hardware: everything the miner relies on, one line each.
 fn check_hardware(cli: &Cli) -> bool {
     let mut ok = true;
@@ -2427,10 +2467,13 @@ fn check_hardware(cli: &Cli) -> bool {
 
 fn main() {
     let cli = Cli::parse();
-    apply_priority(cli.priority);
     if cli.status_json {
         status::enable_json();
     }
+    if let Some(addr) = &cli.serve {
+        serve(&cli, addr);
+    }
+    apply_priority(cli.priority);
     if cli.check_hardware {
         std::process::exit(if check_hardware(&cli) { 0 } else { 1 });
     }

@@ -16,7 +16,7 @@ What it does differently from the miner built into the node:
   submitted, a sentinel hash is re-checked every 4096 hashes, and a golden
   self-test runs at start-up. A miner that diverges from the reference stops.
 
-Version 0.3.0. License: Apache-2.0 (see `LICENSE`). The Jetsam sources it
+Version 0.3.1. License: Apache-2.0 (see `LICENSE`). The Jetsam sources it
 builds on are vendored unmodified in `vendor/` (Apache-2.0).
 
 ## Requirements
@@ -37,14 +37,14 @@ Check a machine before mining:
 
 Each release ships:
 
-- `towerminer-0.3.0-linux-x86_64.tar.gz` (binary, README, LICENSE)
-- `towerminer-0.3.0-windows-x86_64.zip` (`towerminer.exe`, README, LICENSE)
+- `towerminer-0.3.1-linux-x86_64.tar.gz` (binary, README, LICENSE)
+- `towerminer-0.3.1-windows-x86_64.zip` (`towerminer.exe`, README, LICENSE)
 - `SHA256SUMS`
 
 Verify before you run:
 
     sha256sum -c SHA256SUMS --ignore-missing        # Linux
-    certutil -hashfile towerminer-0.3.0-windows-x86_64.zip SHA256   # Windows
+    certutil -hashfile towerminer-0.3.1-windows-x86_64.zip SHA256   # Windows
 
 ## Solo mining with your own node
 
@@ -76,10 +76,10 @@ searches the nonce.
 The node proves every block before it hands out work, and that proof runs on
 the same CPUs: see [Leave your node room](#leave-your-node-room-the-logbook-proof).
 
-To mine from another machine on your network, start the node with
-`--rpc-listen <lan-address>:9701` and point `--rpc` at it. The Bearer token
-authenticates the miner but plain HTTP is not encrypted: keep the RPC port on
-a private network or behind a firewall, never open on the Internet.
+To mine from the other machines of your network with this one node, run the
+LAN relay on the node's machine: see [Several machines, one
+node](#several-machines-one-node-the-lan-relay). Do not open the node's own
+RPC port to the network: it also serves the wallet.
 
 Blocks found are logged (`SOLVED h=... hash=...`) and the node reports them
 with `jetsam-cli mining` / `jetsam-cli balance`.
@@ -111,6 +111,133 @@ Check which logical CPUs share a core with `lscpu -e` before writing a list.
 On a machine that only mines, with no node on it, `--priority normal` leaves
 the priority unchanged.
 
+## Several machines, one node: the LAN relay
+
+A Jetsam node that builds a block proves the whole history of the chain in it
+(the logbook proof; the node is the *logbook prover*). One node is enough for
+a whole home network: the other machines only search the hash (TowerWalk),
+at their full rate, and need no node, no chain and no disk.
+
+    machine with the node:  jetsam --mode extminer  +  towerminer --serve (the relay)
+    other machines:         towerminer --rpc http://<relay address> --key <LAN key>
+
+The relay runs on the node's machine and is the node's only miner. It keeps
+the node's template and hands it to every machine with a nonce region of its
+own, so no two machines search the same nonces; it passes each solution to
+the node once, and answers "stale" to a second solution on a template already
+won. Every block is paid to the node's wallet.
+
+What it lets through, and nothing else:
+
+- **Your local network only.** The relay listens only on a private
+  (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), link-local or loopback
+  address, and refuses connections from any other address.
+- **Its own key.** Mining machines present the *LAN key* (at least 16
+  characters). It is not the node's mining key: that key stays on the node's
+  machine and the relay never sends it to anyone.
+- **Mining only.** `jetsam_getBlockTemplate` and `jetsam_submitBlock`, what
+  towerminer calls. No wallet, chain or administration method passes.
+
+`--allow-public` lifts the address rules. It is off by default and risky:
+the relay speaks plain HTTP, so on a public address the LAN key travels in
+clear, and anyone who reads it can mine on your node.
+
+### Recipe 1 — solo: node and miner on one machine
+
+Linux:
+
+    jetsam --mode extminer --mining-key '<node key>'
+    TOWERMINER_KEY='<node key>' towerminer --rpc http://127.0.0.1:9701
+
+Windows (cmd):
+
+    jetsam.exe --mode extminer --mining-key <node key>
+    set TOWERMINER_KEY=<node key>
+    towerminer.exe --rpc http://127.0.0.1:9701
+
+### Recipe 2 — the node for your network: node + relay
+
+Find the machine's address on your network (`hostname -I` on Linux, the
+"IPv4 Address" line of `ipconfig` on Windows); below, `192.168.1.10`. Choose
+a LAN key, for example with `openssl rand -hex 16` (Linux) or
+`powershell -Command "[guid]::NewGuid().ToString('N')"` (Windows).
+
+Linux:
+
+    jetsam --mode extminer --mining-key '<node key>'
+    TOWERMINER_KEY='<node key>' TOWERMINER_LAN_KEY='<LAN key>' \
+        towerminer --serve 192.168.1.10:9702 --rpc http://127.0.0.1:9701
+
+Windows (cmd):
+
+    jetsam.exe --mode extminer --mining-key <node key>
+    set TOWERMINER_KEY=<node key>
+    set TOWERMINER_LAN_KEY=<LAN key>
+    towerminer.exe --serve 192.168.1.10:9702 --rpc http://127.0.0.1:9701
+
+(`--key` and `--lan-key` work too; the environment keeps the keys out of
+the process list.) The relay itself hashes nothing and runs at normal
+priority. To mine on this machine as well, start a miner through the relay,
+like any other machine (recipe 3), in another terminal:
+
+    TOWERMINER_KEY='<LAN key>' towerminer --rpc http://192.168.1.10:9702 --worker-name node-pc
+
+It runs at low priority, as always, so the node's logbook proof keeps the CPU
+first.
+
+### Recipe 3 — the mining machines
+
+Linux:
+
+    TOWERMINER_KEY='<LAN key>' towerminer --rpc http://192.168.1.10:9702 --worker-name attic
+
+Windows (cmd):
+
+    set TOWERMINER_KEY=<LAN key>
+    towerminer.exe --rpc http://192.168.1.10:9702 --worker-name attic
+
+`--worker-name` is optional; it names the machine in the relay's list (else
+its address). On a machine that runs nothing else, `--priority normal` is
+fine too.
+
+### Firewall
+
+The mining machines connect to the relay's port (9702 above) on the node's
+machine. On **Windows**, the first `--serve` makes Windows ask whether
+towerminer may accept connections: allow it on **private networks** only.
+On **Linux**, if a firewall runs on the node's machine, open that TCP port
+to your local network yourself (and to it only); towerminer never changes a
+firewall. Never forward this port from your router to the Internet.
+
+### What the relay shows
+
+Every 30 s (`--report-secs`) its log sums up the state, the height, the
+workers, their total rate and the blocks, then one line per machine: name,
+address, CPU, rate, when it was last seen, blocks found / accepted /
+refused. Each solution is logged with its verdict (`BLOCK ACCEPTED h=...
+from attic (192.168.1.21)`). With `--status-json`, stdout carries:
+
+    {"type":"relay","ts":1790763206,"version":"0.3.1","listen":"192.168.1.10:9702","upstream":"http://127.0.0.1:9701","state":"serving","message":"","height":25310,"workers":2,"hps":31000,"found":3,"accepted":2,"refused":1,"unknown":0,"uptime_s":3605}
+    {"type":"workers","ts":1790763206,"workers":[{"id":"192.168.1.21/attic","name":"attic","ip":"192.168.1.21","cpu":"Ryzen 9 5950X - 32t (2/core, 1 pads)","version":"towerminer/0.3.1","hps":16890,"last_seen":1790763205,"jobs":1234,"found":2,"accepted":2,"refused":0,"unknown":0,"region":2861541377}]}
+    {"type":"block","ts":1790763300,"height":25311,"result":"accepted","hash":"<block hash, hex>","worker":"attic (192.168.1.21)","ip":"192.168.1.21","message":""}
+
+- `relay` every 5 s: `state` is `serving` (a live template), `waiting`
+  (no template yet, the node is synchronizing, or a block was just found) or
+  `error` (the node does not answer, or refuses the relay's key), with
+  `message` saying why; `workers` counts the machines seen in the last
+  2 minutes and `hps` adds up the rates they report.
+- `workers` every 5 s: every machine seen in the last hour; `name` is null
+  without `--worker-name`, `hps` is the rate the machine reports,
+  `last_seen` the time of its last request.
+- `block` for every solution: `accepted`, `refused` (stale, or refused by
+  the node) or `unknown` (the node did not answer).
+
+A solution found while the node still proves its template waits for the end
+of that proof, then for the seal: the relay retries for up to 110 s. A miner
+waits 120 s for its answer (towerminer 0.3.0: 45 s). When the node takes
+longer, the miner counts the block `unknown` while the relay still gets the
+verdict and counts it.
+
 ## Mining with a pool
 
 Any pool that serves the `jetsam-miner` protocol works:
@@ -125,7 +252,7 @@ behind the same key never search the same nonces.
 By default the miner sends no name for you or your machine. With every
 request it adds these HTTP headers:
 
-- `X-Jetsam-Version` (`towerminer/0.3.0`) and `X-Jetsam-PoW` (`walk`): the
+- `X-Jetsam-Version` (`towerminer/0.3.1`) and `X-Jetsam-PoW` (`walk`): the
   node or pool knows which work this miner can compute.
 - `X-Jetsam-Hashrate`: the measured hash rate, once known.
 - `X-Jetsam-CPU`: the CPU model, the number of worker threads and the
@@ -211,7 +338,7 @@ outside_region=0`.
 With `--status-json`, stdout carries one JSON object per line (flushed at
 every line); the human log stays on stderr:
 
-    {"type":"profile","version":"0.3.0","backend":"avx2+vpclmul","cpu":"Ryzen 9 5950X","threads":16,"tpc":1,"pads":1,"prefetch":false,"kernel":"fast(simple+fill1,pipe)","pages":"2M"}
+    {"type":"profile","version":"0.3.1","backend":"avx2+vpclmul","cpu":"Ryzen 9 5950X","threads":16,"tpc":1,"pads":1,"prefetch":false,"kernel":"fast(simple+fill1,pipe)","pages":"2M"}
     {"type":"status","ts":1790763206,"hps":16890.2,"height":25310,"found":3,"accepted":3,"refused":0,"unknown":0,"uptime_s":3605,"state":"mining","message":""}
     {"type":"block","ts":1790763300,"height":25311,"result":"accepted","hash":"<block hash, hex>"}
     {"type":"error","message":"..."}
@@ -236,7 +363,7 @@ are printed, exit code 0.
 |---:|---|
 | 0 | clean stop |
 | 1 | fatal error (no usable CPU, memory mapping failed, malformed template, ...) |
-| 2 | start-up self-test failed, or invalid arguments |
+| 2 | start-up self-test failed, or invalid arguments (`--serve`: an address outside the local network, a missing or too short LAN key, or one equal to the node key) |
 | 3 | the kernel diverged from the reference walk (nothing was submitted) |
 | 4 | huge pages required (`--require-huge`) and absent, or THP disabled |
 

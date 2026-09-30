@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.3.1 — 2026-09-30
+
+- **LAN relay, `--serve IP:PORT`**: one Jetsam node for a whole home
+  network. The relay runs on the node's machine, is the node's only miner,
+  and serves the node's template to every towerminer of the network, each
+  with a nonce region of its own; a solution reaches the node once per
+  template, a second one on a template already won is answered "stale".
+  It waits and retries like a pool: the node's "template still being
+  prepared" and "waiting for network synchronization" are retried while the
+  template lives, and "already active" keeps the template the relay holds.
+- **LAN only**: the relay refuses to listen on an address that is not
+  private (RFC 1918), link-local or loopback, and refuses clients outside
+  them. `--allow-public` lifts both rules (off by default; risky, plain
+  HTTP).
+- **Its own key**: miners present the LAN key (`--lan-key` or
+  `TOWERMINER_LAN_KEY`, at least 16 characters, never the node's key). The
+  node's key stays on the node's machine: never sent to a miner, never
+  printed.
+- **Mining methods only**: `jetsam_getBlockTemplate` and
+  `jetsam_submitBlock` pass; any other method is refused without reaching
+  the node, and so is a miner's own payout address (blocks pay the node's
+  wallet).
+- **Submission timeout 120 s** (was 45 s): through a relay, a solution
+  found while the node still proves its template waits for that proof; one
+  was answered accepted after 49 s on the testnet, when the miner had
+  already given up and counted it `unknown`.
+- **Per-machine figures**: address, `--worker-name`, CPU, reported rate,
+  last request, blocks found / accepted / refused, in the log every
+  `--report-secs` and in `--status-json` (`relay` and `workers` events every
+  5 s, `block` for every solution).
+
 ## 0.3.0 — 2026-09-30 — first public release
 
 - **Public release**, Apache-2.0, for Linux (x86-64, glibc 2.34+) and
