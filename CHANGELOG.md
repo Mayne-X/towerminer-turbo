@@ -9,7 +9,11 @@
   template, a second one on a template already won is answered "stale".
   It waits and retries like a pool: the node's "template still being
   prepared" and "waiting for network synchronization" are retried while the
-  template lives, and "already active" keeps the template the relay holds.
+  template lives, and "already active" keeps the template the relay holds
+  (served on, a few seconds at a time and 240 s at most, while the node's
+  slot still takes solutions after the life it announced: the machines
+  mined through that window instead of idling). A solution the node was
+  still waiting on when a new block arrived is reported "stale".
 - **LAN only**: the relay refuses to listen on an address that is not
   private (RFC 1918), link-local or loopback, and refuses clients outside
   them. `--allow-public` lifts both rules (off by default; risky, plain

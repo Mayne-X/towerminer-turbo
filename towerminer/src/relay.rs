@@ -63,6 +63,13 @@ const NODE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(75);
 /// the block "unknown" rather than refused; the relay keeps going and
 /// records the real outcome.
 const MINER_SUBMIT_WAIT: Duration = Duration::from_secs(115);
+/// After the life the node announced, a template stays served while the
+/// node answers "already active" (its slot still takes solutions: it lives
+/// 120 s from the end of the proof, the announced life 120 s from the
+/// start), a few seconds at a time, and never longer than this after the
+/// relay first saw it.
+const SLOT_HOLD_STEP: Duration = Duration::from_secs(3);
+const SLOT_HOLD_MAX: Duration = Duration::from_secs(240);
 /// A miner is listed as active this long after its last request.
 const ACTIVE_FOR: u64 = 120;
 /// And forgotten after this.
@@ -340,6 +347,7 @@ struct Tpl {
     deadline: Instant,
     /// A block was accepted on it: the node consumed it.
     won: bool,
+    first_seen: Instant,
 }
 
 #[derive(Default)]
@@ -504,7 +512,7 @@ impl Relay {
                         t.deadline = deadline;
                     } else {
                         eprintln!("relay: new template h={height} tpl={id} (life {} s)", ttl.as_secs());
-                        up.tpl = Some(Tpl { value: v, id: id.clone(), height, deadline, won: false });
+                        up.tpl = Some(Tpl { value: v, id: id.clone(), height, deadline, won: false, first_seen: now });
                         if !up.served.iter().any(|(i, _)| *i == id) {
                             up.served.push_back((id, height));
                             while up.served.len() > SERVED_RING {
@@ -522,6 +530,16 @@ impl Relay {
                     // It will not give another one before; asking faster only
                     // loads it.
                     let busy = msg.contains("already active");
+                    if busy {
+                        // The slot is still ours and still takes solutions:
+                        // keep the machines on the template rather than idle.
+                        if let Some(t) = up.tpl.as_mut().filter(|t| !t.won) {
+                            let end = t.first_seen + SLOT_HOLD_MAX;
+                            if now < end {
+                                t.deadline = t.deadline.max((now + SLOT_HOLD_STEP).min(end));
+                            }
+                        }
+                    }
                     up.fault = msg.contains("401") || msg.starts_with("HTTP ") || msg.starts_with("unreadable");
                     up.hold_until = Some(now + if busy { Duration::from_secs(1) } else { Duration::from_millis(500) });
                     if up.error.as_deref() != Some(msg.as_str()) {
@@ -642,7 +660,17 @@ impl Relay {
                         false
                     };
                     if !retry {
-                        let obj = if obj.is_null() { json!({"code": -32000, "message": msg}) } else { obj };
+                        let waited = m.contains("still being prepared") || m.contains("synchroniz") || m.contains("not ready");
+                        let obj = if waited && !alive {
+                            // The node's wording ("retry") would mislead: the
+                            // chain moved on while the node still proved it.
+                            json!({"code": -32010, "message": format!(
+                                "stale: a new block arrived while the node was still preparing this template ({msg})")})
+                        } else if obj.is_null() {
+                            json!({"code": -32000, "message": msg})
+                        } else {
+                            obj
+                        };
                         break Err(Some(obj));
                     }
                     std::thread::sleep(Duration::from_millis(if m.contains("still being prepared") { 100 } else { 400 }));

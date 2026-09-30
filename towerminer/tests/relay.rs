@@ -48,17 +48,42 @@ fn read_http(r: &mut BufReader<TcpStream>) -> Option<Http> {
     Some((headers, body))
 }
 
+fn template_json(state: &str, ttl_ms: u64) -> Value {
+    json!({
+        "template_id": TPL_ID,
+        "pow_fields_hex": "00".repeat(21 * 16),
+        "nonce_field_index": 20,
+        "difficulty_target_hex": "ff".repeat(32),
+        "height": 77,
+        "expires_in_seconds": 120,
+        "ttl_remaining_ms": ttl_ms,
+        "n_txs": 1,
+        "pow_walk": true,
+        "miner_address": "tj1testpayoutaddress",
+        "state": state,
+    })
+}
+
+/// What the stand-in node answers to its n-th getBlockTemplate (1-based):
+/// the result, or the error message.
+type TemplateAnswer = fn(u32) -> Result<Value, String>;
+
 /// A node in extminer mode, reduced to what the relay needs: one template,
 /// the first submission accepted, every later one refused as consumed.
 fn fake_node() -> FakeNode {
+    fake_node_with(|_| Ok(template_json("ready", 110_000)))
+}
+
+fn fake_node_with(templates: TemplateAnswer) -> FakeNode {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     let seen: Seen = Default::default();
     let s2 = seen.clone();
     let submits = Arc::new(Mutex::new(0u32));
+    let fetches = Arc::new(Mutex::new(0u32));
     std::thread::spawn(move || {
         for c in l.incoming().flatten() {
-            let (seen, submits) = (s2.clone(), submits.clone());
+            let (seen, submits, fetches) = (s2.clone(), submits.clone(), fetches.clone());
             std::thread::spawn(move || {
                 let mut w = c.try_clone().unwrap();
                 let mut r = BufReader::new(c);
@@ -71,19 +96,14 @@ fn fake_node() -> FakeNode {
                         json!({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32001, "message": "unauthorized"}})
                     } else {
                         match method.as_str() {
-                            "jetsam_getBlockTemplate" => json!({"jsonrpc": "2.0", "id": req["id"], "result": {
-                                "template_id": TPL_ID,
-                                "pow_fields_hex": "00".repeat(21 * 16),
-                                "nonce_field_index": 20,
-                                "difficulty_target_hex": "ff".repeat(32),
-                                "height": 77,
-                                "expires_in_seconds": 120,
-                                "ttl_remaining_ms": 110000,
-                                "n_txs": 1,
-                                "pow_walk": true,
-                                "miner_address": "tj1testpayoutaddress",
-                                "state": "ready",
-                            }}),
+                            "jetsam_getBlockTemplate" => {
+                                let mut n = fetches.lock().unwrap();
+                                *n += 1;
+                                match templates(*n) {
+                                    Ok(t) => json!({"jsonrpc": "2.0", "id": req["id"], "result": t}),
+                                    Err(m) => json!({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32000, "message": m}}),
+                                }
+                            }
                             "jetsam_submitBlock" => {
                                 let mut n = submits.lock().unwrap();
                                 *n += 1;
@@ -363,4 +383,40 @@ fn the_relay_refuses_to_start_on_a_public_address_or_without_a_proper_lan_key() 
     let (code, _, err) = refused_start(&["--serve", "127.0.0.1:9702"], Some(NODE_KEY), Some(NODE_KEY));
     assert_eq!(code, 2, "{err}");
     assert!(!err.contains(NODE_KEY), "the key itself is never printed: {err}");
+}
+
+/// The node's published work (the preview) lives 120 s from its publication,
+/// its submittable slot 120 s from the end of its proof. Between the two it
+/// answers "already active" to a template request and still takes solutions:
+/// the relay keeps serving the template it holds, rather than leave every
+/// machine idle until the slot frees.
+#[test]
+fn the_template_is_served_while_the_node_says_its_slot_is_still_active() {
+    let node = fake_node_with(|n| match n {
+        1 => Ok(template_json("preview", 1500)),
+        _ => Err("external mining attempt is already active".into()),
+    });
+    let r = relay(&node, LAN_KEY);
+    template(&r.url, "alpha");
+    std::thread::sleep(Duration::from_secs(4));
+    let (_, body) = call(&r.url, Some(LAN_KEY), Some("alpha"), "jetsam_getBlockTemplate", json!([""]));
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["result"]["template_id"], TPL_ID, "still served past the preview's life: {body}");
+    assert!(v["result"]["expires_in_seconds"].as_u64().unwrap() <= 3, "{body}");
+}
+
+/// Any other answer says nothing about the slot: the template stops at the
+/// life the node announced.
+#[test]
+fn a_template_is_not_served_past_its_life_on_any_other_answer() {
+    let node = fake_node_with(|n| match n {
+        1 => Ok(template_json("preview", 1500)),
+        _ => Err("mining is waiting for network synchronization".into()),
+    });
+    let r = relay(&node, LAN_KEY);
+    template(&r.url, "alpha");
+    std::thread::sleep(Duration::from_secs(4));
+    let (_, body) = call(&r.url, Some(LAN_KEY), Some("alpha"), "jetsam_getBlockTemplate", json!([""]));
+    assert!(body.contains("no live template"), "{body}");
+    assert!(body.contains("synchroniz"), "{body}");
 }

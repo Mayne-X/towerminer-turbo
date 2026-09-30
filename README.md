@@ -125,7 +125,10 @@ The relay runs on the node's machine and is the node's only miner. It keeps
 the node's template and hands it to every machine with a nonce region of its
 own, so no two machines search the same nonces; it passes each solution to
 the node once, and answers "stale" to a second solution on a template already
-won. Every block is paid to the node's wallet.
+won. When the node says its single mining slot is still active (it keeps
+taking solutions for a while after it stops handing the template out), the
+relay keeps the machines on the template it holds rather than leave them
+idle. Every block is paid to the node's wallet.
 
 What it lets through, and nothing else:
 
