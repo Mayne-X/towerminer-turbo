@@ -22,8 +22,6 @@ All numbers below were **measured**, September 2026, on the TowerWalk proof of w
 | Ryzen 9 5950X | towerminer 0.2.1, 1 x 1 x 0, 16 threads | **17 400 H/s** | 139.6 W | 124.6 H/J | +39 % vs the node |
 | Ryzen 9 5950X | towerminer 0.2.1 `--policy efficiency` (2 x 2 x 1) | 16 472 H/s | 115 W | **142.6 H/J** | +45 % H/J vs the node |
 | Ryzen 9 5950X | towerminer 0.2.2, default | 17 360 H/s | ~140 W | ~124 H/J | 3 alternated runs vs 0.2.1: 17 282 H/s (noise) |
-| Ryzen 9 5950X | cpuminer-rplant 6.0.17 (closed source), auto = 16 threads | 15 766 H/s | 139.4 W | 113 H/J | same machine, same session; towerminer +10.4 % |
-| Ryzen 9 5950X | cpuminer-rplant 6.0.17, 32 threads | 13 221 H/s | 129.6 W | 102 H/J | |
 | Ryzen 9 7950X3D (Zen 4), 8 cores of the frequency CCD | **2 x 1 x 0** | **15 240 H/s** | ~90 W (capped) | ~169 H/J | runs 15 150 / 15 330; now the Zen 4/5 default |
 | Ryzen 9 7950X3D, same 8 cores | 1 x 2 x 0 (0.2.1 default) | 13 840 H/s | ~90 W | ~154 H/J | 2 x 1 x 1: 15 010 / 14 970 ; 2 x 2 x 1: 13 270 / 13 290 ; 1 x 1 x 0: 9 520 / 10 030 |
 | 2 x EPYC 7742 (Zen 2), 112 cores | **2 x 1 x 1** | **57 230 H/s** | ~310 W | ~185 H/J | shared host (30-60 cores of other load): runs 56 790 / 57 680; now the Zen 2 default |
