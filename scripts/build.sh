@@ -32,8 +32,8 @@ ROOT=$PWD
 VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' towerminer/Cargo.toml | head -1)
 DOCKER=${DOCKER:-docker}
 RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}
-CPUS=${TM_CPUS:-8}
-JOBS=${TM_JOBS:-8}
+CPUS=${TM_CPUS:-2}
+JOBS=${TM_JOBS:-4}
 NRAND=${TM_GATE_RANDOM:-300}
 NSECS=${TM_NONCE_SECS:-20}
 IMAGE=towerminer-build:jammy
