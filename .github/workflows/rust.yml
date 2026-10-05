@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quick:
+    name: vendor checksum + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Vendor tree matches VENDOR.sha256
+        working-directory: vendor
+        run: sha256sum -c --quiet ../VENDOR.sha256
+      - name: Unit tests
+        run: cargo test --release --locked -p towerminer
+
+  release:
+    name: docker build + release gate (ubuntu 22.04 & 24.04)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Release build + gate via official script
+        run: |
+          chmod +x scripts/build.sh
+          scripts/build.sh
+      # scripts/build.sh already refuses mutants, a glibc floor regression,
+      # missing GATE PASS on 22.04/24.04, CHECK-NONCES bad=0 dup=0, and any
+      # release-hidden build path in either binary.
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: towerminer-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
