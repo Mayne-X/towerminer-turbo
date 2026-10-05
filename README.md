@@ -68,15 +68,6 @@ Ring: the 4 × 512 KiB rotating working set does not fit a 512 KiB Zen 2 L2,
 so pads already share L3 vs L2 and the fill overlap loses to the 2-group
 fold's extra CLMUL work.
 
-**Where to expect the win** (from the project's bench notes, not measured):
-`pipe2` targets the 2–3 MiB-per-core L2 regime — Core Ultra 9 285K / Arrow
-Lake (~+2–5 %), Raptor Lake P-cores (~+2–4 %), Sapphire Rapids (~+2–4 %) —
-where all four live rotational pads can stay L2-resident with one fill
-head-room left. At 512 KiB or 1 MiB L2 it falls like it did on Zen 2.
-
-`pf-hint t1` is expected to be neutral-to-small-positive on every L2 regime,
-never negative; measured ±0 % on Zen 2.
-
 Both are strict opt-ins: default deployment bytes are behaviour-identical to
 v0.3.1.
 
