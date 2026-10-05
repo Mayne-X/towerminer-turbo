@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.2 — 2026-10-05
+
+- **`pipe2` kernel (fast kernel, `--pads 2`): the rotating 4-pad pipeline.**
+  Each worker alternates two pad pairs: while pair A walks, pair B fills
+  the streams of seeds B will walk two slots later. Fill injections are
+  produced by the same 2-group packed fold that does the walk folds
+  (existing `walk_pipe` anchor trick across pairs); the interrupted slot
+  chain is gate-verified against the reference walker (256 golden +
+  random seeds, prefetch x hint x page size, cold + warm + None-tail
+  slots). Strict opt-in: `--pipe2 1`. The worker maps a 4-pad region
+  for the same two hashes per slot. One extra worker-task priority
+  adjustments are not needed.
+- **`--pf-hint t0|t1`: prefetch cache-level parameterization** for the
+  next-address prefetch. Default `t0` preserves existing behaviour
+  byte-for-byte on the hot path instruction mix.
+- **Windows-gnu build caveat documented**: TDM-GCC ships no separate
+  `libgcc_eh.a` (it is merged into `libgcc.a`), which breaks building
+  this tree on a Windows-gnu host. One-liner fix:
+  `Copy-Item C:\TDM-GCC-64\lib\gcc\x86_64-w64-mingw32\<ver>\libgcc.a C:\...\libgcc_eh.a`.
+- Results on Zen 2 (Ryzen 5 3600): pipe2 neutral-to-negative (~-5 %),
+  pf-hint t1 neutral. Designed for 2--3 MiB L2 parts (Arrow Lake, Raptor
+  Lake P-cores, Sapphire Rapids): expected +2--5 % from hiding fills in
+  the L2-latency bubbles.
+
 ## 0.3.1 — 2026-09-30
 
 - **LAN relay, `--serve IP:PORT`**: one Jetsam node for a whole home

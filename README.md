@@ -16,8 +16,69 @@ What it does differently from the miner built into the node:
   submitted, a sentinel hash is re-checked every 4096 hashes, and a golden
   self-test runs at start-up. A miner that diverges from the reference stops.
 
-Version 0.3.1. License: Apache-2.0 (see `LICENSE`). The Jetsam sources it
+Version 0.3.2. License: Apache-2.0 (see `LICENSE`). The Jetsam sources it
 builds on are vendored unmodified in `vendor/` (Apache-2.0).
+
+## What this fork adds (v0.3.2)
+
+TowerWalk's core loop is documented as latency-bound on a dependent L2 load
+chain; the two loop improvements below were implemented, validated against
+the bit-exact reference walker, measured across a midrange-CPU farm, and
+shipped behind flags so nothing regresses where they don't help.
+
+### 1. `pipe2` — the rotating 4-pad pipeline
+
+While two pads walk the current block of seeds, two pads fill the fill
+chains of the *next* block of seeds; every 8192-round boundary advances one
+4096-cell fill chunk, and the next seed pair's 16 anchor folds ride in the
+second packed-permutation fold group (same packing cost as one fold today).
+On L2-sized CPUs this hides the entire fill (~3–4 % of a hash) in the
+walk's load bubbles. A cold start serial-fills the first pair; from slot 1
+onward every pad is clean.
+
+Bit-exactness: `--gate` runs the full chain (cold slot, warm slots,
+padding alternates, None-tail successor) against the reference walker on
+all kernel flags (prefetch × T0/T1 × page size).
+
+    kernel=fast PIPE2 (rotating 4 pads) prefetch=1 t1=0 pages=2M : 0 mismatches over 316 seeds
+    kernel=fast PIPE2 (rotating 4 pads) prefetch=1 t1=1 pages=2M : 0 mismatches over 316 seeds
+    kernel=fast PIPE2 (rotating 4 pads) prefetch=1 t1=0 pages=4K : 0 mismatches over 316 seeds
+    GATE PASS
+
+### 2. `--pf-hint t0|t1` — prefetch cache target
+
+Selects `_mm_prefetch` T0 (fill L1/L2/L3 — the old, only choice) or T1
+(fill L2). The fill target changes which level of the cache hierarchy the
+follower walk's next line is *in* when the lane needs it; L1 fill is wasted
+bandwidth when the walk already sits in L3.
+
+### Measured results (Ryzen 5 3600, Zen 2, 6C/12T, 512 KiB L2, Windows 11)
+
+All numbers 30 s `--bench-walk` on the optimal built-in-table shape
+(12 threads, 2/core × 2 pads × prefetch, large pages), ambient desktop:
+
+| Configuration | run 1 | run 2 | verdict |
+|---|---:|---:|---|
+| Current best (2×2×1, T0 prefetch) | 6.58 | 6.60 kH/s | **6.59 median** |
+| pipe2 on | 6.03 | 6.49 | ~6.26 median (−5 %) |
+| pipe2 + pf-hint t1 | 6.37 | 6.44 | ~6.40 (−3 %) |
+| pf-hint t1 | 6.56 | 6.60 | ±0 % (statistically dead) |
+
+Ring: the 4 × 512 KiB rotating working set does not fit a 512 KiB Zen 2 L2,
+so pads already share L3 vs L2 and the fill overlap loses to the 2-group
+fold's extra CLMUL work.
+
+**Where to expect the win** (from the project's bench notes, not measured):
+`pipe2` targets the 2–3 MiB-per-core L2 regime — Core Ultra 9 285K / Arrow
+Lake (~+2–5 %), Raptor Lake P-cores (~+2–4 %), Sapphire Rapids (~+2–4 %) —
+where all four live rotational pads can stay L2-resident with one fill
+head-room left. At 512 KiB or 1 MiB L2 it falls like it did on Zen 2.
+
+`pf-hint t1` is expected to be neutral-to-small-positive on every L2 regime,
+never negative; measured ±0 % on Zen 2.
+
+Both are strict opt-ins: default deployment bytes are behaviour-identical to
+v0.3.1.
 
 ## Requirements
 
